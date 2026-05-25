@@ -1,0 +1,737 @@
+"""TS to MP4 Converter — desktop app."""
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import os
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import Optional
+
+from converter import (
+    ConflictPolicy,
+    ConversionError,
+    Converter,
+    CancelledError,
+    Job,
+    MODE_LABELS,
+    Mode,
+    detect_hw_encoders,
+)
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _HAS_DND = True
+except ImportError:
+    _HAS_DND = False
+
+try:
+    import sv_ttk
+    _HAS_SVTTK = True
+except ImportError:
+    _HAS_SVTTK = False
+
+APP_NAME = "TS to MP4 Converter"
+APP_VERSION = "1.0"
+SAME_AS_SOURCE = "(same folder as source)"
+
+
+def get_config_dir() -> Path:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA", str(Path.home()))
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+    p = Path(base) / "TSConverter"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+class Settings:
+    PATH = get_config_dir() / "settings.json"
+
+    DEFAULTS = {
+        "output_dir": SAME_AS_SOURCE,
+        "mode": Mode.AUTO.value,
+        "conflict": ConflictPolicy.RENAME.value,
+        "prefer_hw": True,
+        "concurrency": 2,
+        "theme": "system",
+        "geometry": "880x600",
+    }
+
+    def __init__(self):
+        self.data = dict(self.DEFAULTS)
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.PATH, "r", encoding="utf-8") as fp:
+                self.data.update(json.load(fp))
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def save(self):
+        try:
+            with open(self.PATH, "w", encoding="utf-8") as fp:
+                json.dump(self.data, fp, indent=2)
+        except OSError:
+            pass
+
+    def get(self, key):
+        return self.data.get(key, self.DEFAULTS.get(key))
+
+    def set(self, key, value):
+        self.data[key] = value
+
+
+def fmt_size(n: int) -> str:
+    if n <= 0:
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def fmt_duration(seconds: float) -> str:
+    if seconds <= 0:
+        return ""
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def fmt_eta(seconds: float) -> str:
+    if seconds <= 0 or seconds > 24 * 3600:
+        return ""
+    return fmt_duration(seconds)
+
+
+def open_in_explorer(path: Path):
+    path = Path(path)
+    if not path.exists():
+        return
+    if os.name == "nt":
+        if path.is_file():
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        else:
+            os.startfile(str(path))
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R" if path.is_file() else "", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path.parent if path.is_file() else path)])
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.settings = Settings()
+        self.jobs: list[Job] = []
+        self.job_by_iid: dict[str, Job] = {}
+        self.cancel_event = threading.Event()
+        self.is_running = False
+        self.worker: Optional[threading.Thread] = None
+        self.converter = Converter(prefer_hw=self.settings.get("prefer_hw"))
+
+        self._setup_window()
+        self._build_ui()
+        self._enable_dnd()
+        self._refresh_button_state()
+
+    def _setup_window(self):
+        self.root.title(APP_NAME)
+        self.root.geometry(self.settings.get("geometry"))
+        self.root.minsize(720, 460)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        if _HAS_SVTTK:
+            try:
+                sv_ttk.set_theme("light")
+            except Exception:
+                pass
+
+    def _build_ui(self):
+        self._build_menu()
+
+        # Toolbar
+        toolbar = ttk.Frame(self.root, padding=(10, 8, 10, 4))
+        toolbar.pack(fill="x")
+
+        ttk.Button(toolbar, text="Add files", command=self.add_files).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Remove", command=self.remove_selected).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Clear", command=self.clear_files).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(toolbar, text="Inspect", command=self.inspect_selected).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Show in folder", command=self.show_in_folder).pack(side="left", padx=2)
+
+        # Options strip
+        opts = ttk.Frame(self.root, padding=(10, 4))
+        opts.pack(fill="x")
+
+        ttk.Label(opts, text="Mode:").pack(side="left", padx=(0, 4))
+        self.mode_var = tk.StringVar(value=MODE_LABELS[Mode(self.settings.get("mode"))])
+        mode_combo = ttk.Combobox(
+            opts, textvariable=self.mode_var, state="readonly", width=36,
+            values=list(MODE_LABELS.values()),
+        )
+        mode_combo.pack(side="left", padx=2)
+        mode_combo.bind("<<ComboboxSelected>>", self._on_mode_change)
+
+        ttk.Separator(opts, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        ttk.Label(opts, text="Parallel:").pack(side="left", padx=(0, 4))
+        self.concurrency_var = tk.StringVar(value=str(self.settings.get("concurrency")))
+        conc_combo = ttk.Combobox(
+            opts, textvariable=self.concurrency_var, state="readonly", width=4,
+            values=["1", "2", "3", "4", "5", "6", "8"],
+        )
+        conc_combo.pack(side="left", padx=2)
+        conc_combo.bind("<<ComboboxSelected>>", self._on_concurrency_change)
+
+        ttk.Separator(opts, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        ttk.Label(opts, text="If exists:").pack(side="left", padx=(0, 4))
+        self.conflict_var = tk.StringVar(value=self.settings.get("conflict"))
+        for label, val in (("Rename", ConflictPolicy.RENAME.value),
+                          ("Overwrite", ConflictPolicy.OVERWRITE.value),
+                          ("Skip", ConflictPolicy.SKIP.value)):
+            ttk.Radiobutton(
+                opts, text=label, value=val, variable=self.conflict_var,
+                command=self._on_conflict_change,
+            ).pack(side="left", padx=2)
+
+        # Output folder
+        out_frame = ttk.Frame(self.root, padding=(10, 4))
+        out_frame.pack(fill="x")
+        ttk.Label(out_frame, text="Output:").pack(side="left", padx=(0, 6))
+        self.output_var = tk.StringVar(value=self.settings.get("output_dir"))
+        out_label = ttk.Label(out_frame, textvariable=self.output_var, foreground="#555")
+        out_label.pack(side="left", fill="x", expand=True)
+        ttk.Button(out_frame, text="Browse", command=self.choose_output).pack(side="right", padx=2)
+        ttk.Button(out_frame, text="Same as source", command=self.reset_output).pack(side="right", padx=2)
+
+        # File list
+        list_wrap = ttk.Frame(self.root, padding=(10, 4))
+        list_wrap.pack(fill="both", expand=True)
+
+        cols = ("file", "size", "duration", "status", "progress", "speed", "eta")
+        self.tree = ttk.Treeview(list_wrap, columns=cols, show="headings", selectmode="extended")
+        headings = [
+            ("file", "File", 280, "w"),
+            ("size", "Size", 80, "e"),
+            ("duration", "Length", 80, "e"),
+            ("status", "Status", 200, "w"),
+            ("progress", "Progress", 80, "e"),
+            ("speed", "Speed", 70, "e"),
+            ("eta", "ETA", 70, "e"),
+        ]
+        for key, label, width, anchor in headings:
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width, anchor=anchor)
+        self.tree.tag_configure("failed", foreground="#b00020")
+        self.tree.tag_configure("done", foreground="#0a7d29")
+        self.tree.tag_configure("cancelled", foreground="#996600")
+        self.tree.tag_configure("running", foreground="#0a4d9e")
+        self.tree.bind("<Double-1>", self._on_row_double_click)
+        self.tree.bind("<Delete>", lambda e: self.remove_selected())
+        self.tree.bind("<Button-3>", self._on_right_click)
+
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        # Drop hint overlay
+        if _HAS_DND:
+            hint = ttk.Label(self.root, text="Tip: drag .ts files into the window",
+                             foreground="#888", padding=(10, 0))
+            hint.pack(fill="x")
+
+        # Bottom: overall progress + start/cancel
+        bot = ttk.Frame(self.root, padding=(10, 6, 10, 10))
+        bot.pack(fill="x")
+
+        self.overall_progress = ttk.Progressbar(bot, mode="determinate", maximum=100)
+        self.overall_progress.pack(fill="x", pady=(0, 6))
+
+        bot_row = ttk.Frame(bot)
+        bot_row.pack(fill="x")
+        self.status_label = ttk.Label(bot_row, text=self._initial_status_text())
+        self.status_label.pack(side="left")
+
+        self.cancel_btn = ttk.Button(bot_row, text="Cancel", command=self.cancel_all, state="disabled")
+        self.cancel_btn.pack(side="right", padx=2)
+
+        self.start_btn = ttk.Button(bot_row, text="Start", command=self.start, style="Accent.TButton")
+        self.start_btn.pack(side="right", padx=2)
+
+        # Right-click context menu
+        self.ctx_menu = tk.Menu(self.root, tearoff=0)
+        self.ctx_menu.add_command(label="Open output", command=self.open_output_file)
+        self.ctx_menu.add_command(label="Show in folder", command=self.show_in_folder)
+        self.ctx_menu.add_command(label="Inspect", command=self.inspect_selected)
+        self.ctx_menu.add_separator()
+        self.ctx_menu.add_command(label="Remove from list", command=self.remove_selected)
+
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Add files...", command=self.add_files, accelerator="Ctrl+O")
+        file_menu.add_command(label="Clear list", command=self.clear_files)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=file_menu)
+        self.root.bind_all("<Control-o>", lambda e: self.add_files())
+
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        self.hw_var = tk.BooleanVar(value=self.settings.get("prefer_hw"))
+        edit_menu.add_checkbutton(
+            label="Prefer GPU encoding when available",
+            variable=self.hw_var, command=self._on_hw_change,
+        )
+        menubar.add_cascade(label="Settings", menu=edit_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="About", command=self._show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+
+    def _initial_status_text(self):
+        hw = detect_hw_encoders()
+        if hw:
+            return f"Ready  •  GPU encoder available: {hw[0]}"
+        return "Ready  •  CPU encoding only"
+
+    def _enable_dnd(self):
+        if not _HAS_DND:
+            return
+        self.root.drop_target_register(DND_FILES)
+        self.root.dnd_bind("<<Drop>>", self._on_drop)
+
+    def _on_drop(self, event):
+        raw = event.data
+        paths = self.root.tk.splitlist(raw)
+        self._add_paths([p for p in paths if os.path.isfile(p)])
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Select .ts files",
+            filetypes=[("MPEG-TS files", "*.ts *.m2ts *.mts"), ("All files", "*.*")],
+        )
+        if paths:
+            self._add_paths(list(paths))
+
+    def _add_paths(self, paths):
+        existing = {str(j.src) for j in self.jobs}
+        added = 0
+        for p in paths:
+            p = os.path.abspath(p)
+            if p in existing:
+                continue
+            src = Path(p)
+            try:
+                size = src.stat().st_size
+            except OSError:
+                size = 0
+            job = Job(src=src, out_dir=Path("."), file_size=size)
+            self.jobs.append(job)
+            iid = str(id(job))
+            self.job_by_iid[iid] = job
+            self.tree.insert("", "end", iid=iid, values=self._row_values(job))
+            existing.add(p)
+            added += 1
+        if added:
+            self._refresh_button_state()
+
+    def remove_selected(self):
+        if self.is_running:
+            return
+        for iid in self.tree.selection():
+            job = self.job_by_iid.pop(iid, None)
+            if job:
+                self.jobs.remove(job)
+            self.tree.delete(iid)
+        self._refresh_button_state()
+
+    def clear_files(self):
+        if self.is_running:
+            return
+        self.tree.delete(*self.tree.get_children())
+        self.jobs.clear()
+        self.job_by_iid.clear()
+        self._refresh_button_state()
+
+    def choose_output(self):
+        d = filedialog.askdirectory(title="Select output folder")
+        if d:
+            self.output_var.set(d)
+            self.settings.set("output_dir", d)
+            self.settings.save()
+
+    def reset_output(self):
+        self.output_var.set(SAME_AS_SOURCE)
+        self.settings.set("output_dir", SAME_AS_SOURCE)
+        self.settings.save()
+
+    def _on_mode_change(self, _event=None):
+        label = self.mode_var.get()
+        for mode, lbl in MODE_LABELS.items():
+            if lbl == label:
+                self.settings.set("mode", mode.value)
+                self.settings.save()
+                break
+
+    def _on_conflict_change(self):
+        self.settings.set("conflict", self.conflict_var.get())
+        self.settings.save()
+
+    def _on_concurrency_change(self, _event=None):
+        try:
+            n = int(self.concurrency_var.get())
+        except ValueError:
+            n = 2
+        self.settings.set("concurrency", max(1, min(8, n)))
+        self.settings.save()
+
+    def _on_hw_change(self):
+        v = self.hw_var.get()
+        self.settings.set("prefer_hw", v)
+        self.settings.save()
+        self.converter.prefer_hw = v
+
+    def _selected_mode(self) -> Mode:
+        label = self.mode_var.get()
+        for mode, lbl in MODE_LABELS.items():
+            if lbl == label:
+                return mode
+        return Mode.AUTO
+
+    def _selected_conflict(self) -> ConflictPolicy:
+        return ConflictPolicy(self.conflict_var.get())
+
+    def start(self):
+        if self.is_running or not self.jobs:
+            return
+
+        mode = self._selected_mode()
+        conflict = self._selected_conflict()
+        output_val = self.output_var.get()
+        for j in self.jobs:
+            if j.status in ("Done",):
+                continue
+            j.mode = mode
+            j.conflict = conflict
+            j.out_dir = j.src.parent if output_val == SAME_AS_SOURCE else Path(output_val)
+            j.status = "Queued"
+            j.stage = ""
+            j.error = None
+            j.error_full = None
+            j.seconds_done = 0
+            j.speed = 0
+            j.progress_pct = 0
+            j.eta_seconds = 0
+            j.out_path = None
+            j.actually_used = None
+            j.started_at = None
+            j.completed_at = None
+            self._refresh_row(j)
+
+        self.is_running = True
+        self.cancel_event.clear()
+        self.start_btn.config(state="disabled")
+        self.cancel_btn.config(state="normal")
+        self.status_label.config(text="Converting...")
+        self.overall_progress.config(value=0)
+
+        self.worker = threading.Thread(target=self._run_jobs, daemon=True)
+        self.worker.start()
+
+    def _run_jobs(self):
+        pending = [j for j in self.jobs if j.status != "Done"]
+        total = len(pending)
+        if total == 0:
+            self.root.after(0, lambda: self._finish(0, 0, 0, 0))
+            return
+
+        n_workers = max(1, min(8, int(self.settings.get("concurrency") or 2)))
+        n_workers = min(n_workers, total)
+
+        counts = {"done": 0, "fail": 0, "cancel": 0, "completed": 0}
+        lock = threading.Lock()
+
+        def update_overall():
+            with lock:
+                pct = counts["completed"] / total * 100
+            self._set_overall(pct)
+
+        def worker(job: Job):
+            if self.cancel_event.is_set():
+                job.status = "Cancelled"
+                self._refresh_row(job)
+                with lock:
+                    counts["cancel"] += 1
+                    counts["completed"] += 1
+                update_overall()
+                return
+
+            job.status = "Running"
+            self._refresh_row(job)
+
+            try:
+                self.converter.convert(
+                    job, lambda j=job: self._refresh_row(j), self.cancel_event,
+                )
+                job.status = "Done"
+                job.progress_pct = 100
+                with lock:
+                    counts["done"] += 1
+            except CancelledError:
+                job.status = "Cancelled"
+                with lock:
+                    counts["cancel"] += 1
+                if job.out_path and job.out_path.exists():
+                    try:
+                        job.out_path.unlink()
+                    except OSError:
+                        pass
+            except ConversionError as e:
+                job.status = "Failed"
+                job.error = e.short
+                job.error_full = e.full
+                with lock:
+                    counts["fail"] += 1
+            except Exception as e:
+                job.status = "Failed"
+                job.error = f"{type(e).__name__}: {e}"
+                job.error_full = job.error
+                with lock:
+                    counts["fail"] += 1
+
+            self._refresh_row(job)
+            with lock:
+                counts["completed"] += 1
+            update_overall()
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=n_workers, thread_name_prefix="ffmpeg-worker"
+        ) as pool:
+            list(pool.map(worker, pending))
+
+        self.root.after(
+            0,
+            lambda: self._finish(counts["done"], counts["fail"], counts["cancel"], total),
+        )
+
+    def cancel_all(self):
+        if not self.is_running:
+            return
+        self.cancel_event.set()
+        self.cancel_btn.config(state="disabled")
+        self.status_label.config(text="Cancelling...")
+
+    def _finish(self, success, failed, cancelled, total):
+        self.is_running = False
+        self.cancel_event.clear()
+        self.start_btn.config(state="normal")
+        self.cancel_btn.config(state="disabled")
+        parts = [f"{success}/{total} done"]
+        if failed:
+            parts.append(f"{failed} failed")
+        if cancelled:
+            parts.append(f"{cancelled} cancelled")
+        self.status_label.config(text="  •  ".join(parts))
+        self._refresh_button_state()
+
+    def _row_values(self, job: Job):
+        if job.progress_pct >= 1 or job.status in ("Done", "Running"):
+            pct = f"{job.progress_pct:.0f}%"
+        else:
+            pct = ""
+        status_text = job.stage or job.status
+        if job.status == "Failed" and job.error:
+            status_text = f"Failed: {job.error}"
+        elif job.status == "Done":
+            tail = f" ({job.actually_used})" if job.actually_used and job.actually_used != "remux" else ""
+            status_text = "Done" + tail
+        elif job.status == "Cancelled":
+            status_text = "Cancelled"
+        speed_text = f"{job.speed:.1f}x" if job.speed > 0 and job.status == "Running" else ""
+        eta_text = fmt_eta(job.eta_seconds) if job.status == "Running" else ""
+        return (
+            job.src.name,
+            fmt_size(job.file_size),
+            fmt_duration(job.duration),
+            status_text,
+            pct,
+            speed_text,
+            eta_text,
+        )
+
+    def _refresh_row(self, job: Job):
+        def do():
+            for iid, j in self.job_by_iid.items():
+                if j is job:
+                    if not self.tree.exists(iid):
+                        return
+                    tag = ""
+                    if job.status == "Done":
+                        tag = "done"
+                    elif job.status == "Failed":
+                        tag = "failed"
+                    elif job.status == "Cancelled":
+                        tag = "cancelled"
+                    elif job.status == "Running":
+                        tag = "running"
+                    self.tree.item(iid, values=self._row_values(job), tags=(tag,) if tag else ())
+                    return
+        self.root.after(0, do)
+
+    def _set_overall(self, pct):
+        self.root.after(0, lambda: self.overall_progress.config(value=pct))
+
+    def _refresh_button_state(self):
+        has_jobs = bool(self.jobs)
+        self.start_btn.config(state="normal" if has_jobs and not self.is_running else "disabled")
+
+    def _on_row_double_click(self, _event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        job = self.job_by_iid.get(sel[0])
+        if not job:
+            return
+        if job.status == "Done" and job.out_path:
+            try:
+                os.startfile(str(job.out_path))
+            except OSError:
+                open_in_explorer(job.out_path)
+        elif job.status == "Failed" and (job.error_full or job.error):
+            self._show_text_dialog(f"Error — {job.src.name}", job.error_full or job.error)
+
+    def _on_right_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if row:
+            self.tree.selection_set(row)
+            self.ctx_menu.post(event.x_root, event.y_root)
+
+    def open_output_file(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        job = self.job_by_iid.get(sel[0])
+        if job and job.out_path and job.out_path.exists():
+            try:
+                os.startfile(str(job.out_path))
+            except OSError:
+                open_in_explorer(job.out_path)
+
+    def show_in_folder(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        job = self.job_by_iid.get(sel[0])
+        if not job:
+            return
+        target = job.out_path if (job.out_path and job.out_path.exists()) else job.src
+        open_in_explorer(target)
+
+    def inspect_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Inspect", "Select a file in the list first.")
+            return
+        job = self.job_by_iid.get(sel[0])
+        if not job:
+            return
+        from converter import FFMPEG_PATH, CREATE_NO_WINDOW
+        proc = subprocess.run(
+            [FFMPEG_PATH, "-hide_banner", "-i", str(job.src)],
+            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW,
+        )
+        info = (proc.stderr or proc.stdout or "(no output)").strip()
+
+        magic = ""
+        try:
+            with open(job.src, "rb") as fp:
+                head = fp.read(16)
+            hex_p = " ".join(f"{b:02x}" for b in head)
+            ascii_p = "".join(chr(b) if 32 <= b < 127 else "." for b in head)
+            magic = f"\n\n--- First 16 bytes ---\nhex:   {hex_p}\nascii: {ascii_p}\n"
+            if head[:1] == b"\x47":
+                magic += "MPEG-TS (0x47 sync byte present).\n"
+            elif head[4:8] == b"ftyp":
+                magic += "MP4/QuickTime container — wrong .ts extension?\n"
+            elif head[:4] == b"\x1a\x45\xdf\xa3":
+                magic += "Matroska/WebM — wrong .ts extension?\n"
+            elif head[:3] == b"FLV":
+                magic += "FLV — wrong .ts extension?\n"
+            else:
+                magic += "Unknown signature.\n"
+        except OSError as e:
+            magic = f"\n\n(could not read file head: {e})\n"
+
+        self._show_text_dialog(f"Inspect — {job.src.name}", info + magic, mono=True)
+
+    def _show_text_dialog(self, title, text, mono=False):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("760x460")
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="both", expand=True)
+        font = ("Consolas", 9) if mono else None
+        widget = tk.Text(frame, wrap="word", font=font)
+        widget.insert("1.0", text)
+        widget.config(state="disabled")
+        sb = ttk.Scrollbar(frame, orient="vertical", command=widget.yview)
+        widget.configure(yscrollcommand=sb.set)
+        widget.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+
+    def _show_about(self):
+        hw = detect_hw_encoders()
+        hw_text = ", ".join(hw) if hw else "none detected"
+        msg = (
+            f"{APP_NAME}\nVersion {APP_VERSION}\n\n"
+            f"Python {sys.version.split()[0]}\n"
+            f"Drag-and-drop: {'enabled' if _HAS_DND else 'disabled (pip install tkinterdnd2)'}\n"
+            f"Modern theme: {'enabled' if _HAS_SVTTK else 'disabled (pip install sv-ttk)'}\n"
+            f"Hardware encoders: {hw_text}\n\n"
+            f"Config: {Settings.PATH}"
+        )
+        messagebox.showinfo("About", msg)
+
+    def _on_close(self):
+        if self.is_running:
+            if not messagebox.askokcancel("Quit",
+                                          "A conversion is running. Cancel and quit?"):
+                return
+            self.cancel_event.set()
+            if self.worker:
+                self.worker.join(timeout=3)
+        try:
+            self.settings.set("geometry", self.root.geometry())
+            self.settings.save()
+        except Exception:
+            pass
+        self.root.destroy()
+
+
+def main():
+    if _HAS_DND:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
