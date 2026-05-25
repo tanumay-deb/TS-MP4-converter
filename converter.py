@@ -216,6 +216,7 @@ class Converter:
         job.completed_at = time.time()
 
     def _remux(self, job, on_update, cancel_event):
+        is_ts_family = job.src.suffix.lower() in (".ts", ".m2ts", ".mts")
         cmd = [
             FFMPEG_PATH, "-y",
             "-err_detect", "ignore_err",
@@ -225,7 +226,11 @@ class Converter:
             "-i", str(job.src),
             "-map", "0:v?", "-map", "0:a?",
             "-c", "copy",
-            "-bsf:a", "aac_adtstoasc",
+        ]
+        if is_ts_family:
+            # AAC in MPEG-TS uses ADTS framing; MP4 needs ASC. Not needed for MKV.
+            cmd += ["-bsf:a", "aac_adtstoasc"]
+        cmd += [
             "-avoid_negative_ts", "make_zero",
             "-movflags", "+faststart",
             "-progress", "pipe:1",

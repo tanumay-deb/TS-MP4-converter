@@ -249,7 +249,7 @@ class App:
 
         # Drop hint overlay
         if _HAS_DND:
-            hint = ttk.Label(self.root, text="Tip: drag .ts files into the window",
+            hint = ttk.Label(self.root, text="Tip: drag .ts, .m2ts, or .mkv files into the window",
                              foreground="#888", padding=(10, 0))
             hint.pack(fill="x")
 
@@ -322,8 +322,13 @@ class App:
 
     def add_files(self):
         paths = filedialog.askopenfilenames(
-            title="Select .ts files",
-            filetypes=[("MPEG-TS files", "*.ts *.m2ts *.mts"), ("All files", "*.*")],
+            title="Select video files",
+            filetypes=[
+                ("Video files", "*.ts *.m2ts *.mts *.mkv"),
+                ("MPEG-TS files", "*.ts *.m2ts *.mts"),
+                ("Matroska files", "*.mkv"),
+                ("All files", "*.*"),
+            ],
         )
         if paths:
             self._add_paths(list(paths))
@@ -664,14 +669,18 @@ class App:
             hex_p = " ".join(f"{b:02x}" for b in head)
             ascii_p = "".join(chr(b) if 32 <= b < 127 else "." for b in head)
             magic = f"\n\n--- First 16 bytes ---\nhex:   {hex_p}\nascii: {ascii_p}\n"
+            ext = job.src.suffix.lower()
             if head[:1] == b"\x47":
                 magic += "MPEG-TS (0x47 sync byte present).\n"
             elif head[4:8] == b"ftyp":
-                magic += "MP4/QuickTime container — wrong .ts extension?\n"
+                magic += f"MP4/QuickTime container — wrong {ext} extension?\n"
             elif head[:4] == b"\x1a\x45\xdf\xa3":
-                magic += "Matroska/WebM — wrong .ts extension?\n"
+                if ext in (".mkv", ".webm"):
+                    magic += "Matroska/WebM container.\n"
+                else:
+                    magic += f"Matroska/WebM — wrong {ext} extension?\n"
             elif head[:3] == b"FLV":
-                magic += "FLV — wrong .ts extension?\n"
+                magic += f"FLV — wrong {ext} extension?\n"
             else:
                 magic += "Unknown signature.\n"
         except OSError as e:
