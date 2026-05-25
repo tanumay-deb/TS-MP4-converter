@@ -17,7 +17,7 @@ A desktop app to batch-convert `.ts` (MPEG-TS) video files to `.mp4`, with GPU a
 
 ### Option 1 — Download the `.exe` (easiest)
 
-1. Grab the latest `TSConverter.exe` from the [Releases](https://github.com/YOUR_USERNAME/ts-mp4-converter/releases) page
+1. Grab the latest `TSConverter.exe` from the [Releases](https://github.com/tanumay-deb/TS-MP4-converter/releases) page
 2. Double-click to run. No Python needed.
 
 ### Option 2 — Install with pipx (one-liner)
@@ -25,7 +25,7 @@ A desktop app to batch-convert `.ts` (MPEG-TS) video files to `.mp4`, with GPU a
 Requires Python 3.9+ and [pipx](https://pipx.pypa.io/):
 
 ```bash
-pipx install git+https://github.com/YOUR_USERNAME/ts-mp4-converter.git
+pipx install git+https://github.com/tanumay-deb/TS-MP4-converter.git
 ```
 
 Then launch from anywhere:
@@ -37,8 +37,8 @@ ts-mp4-converter
 ### Option 3 — Clone and run
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ts-mp4-converter.git
-cd ts-mp4-converter
+git clone https://github.com/tanumay-deb/TS-MP4-converter.git
+cd TS-MP4-converter
 pip install -r requirements.txt
 python app.py
 ```
