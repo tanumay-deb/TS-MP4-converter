@@ -36,7 +36,7 @@ except ImportError:
     _HAS_SVTTK = False
 
 APP_NAME = "TS to MP4 Converter"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 SAME_AS_SOURCE = "(same folder as source)"
 
 
@@ -59,8 +59,10 @@ class Settings:
         "conflict": ConflictPolicy.RENAME.value,
         "prefer_hw": True,
         "concurrency": 2,
-        "theme": "system",
+        "theme": "light",
         "geometry": "880x600",
+        "delete_source_after_success": False,
+        "delete_source_warned": False,
     }
 
     def __init__(self):
@@ -138,11 +140,14 @@ class App:
         self.is_running = False
         self.worker: Optional[threading.Thread] = None
         self.converter = Converter(prefer_hw=self.settings.get("prefer_hw"))
+        self._drag_iid: Optional[str] = None
+        self._drag_started: bool = False
 
         self._setup_window()
         self._build_ui()
         self._enable_dnd()
         self._refresh_button_state()
+        self.root.after(200, self._load_queue_if_exists)
 
     def _setup_window(self):
         self.root.title(APP_NAME)
@@ -152,7 +157,8 @@ class App:
 
         if _HAS_SVTTK:
             try:
-                sv_ttk.set_theme("light")
+                theme = self.settings.get("theme")
+                sv_ttk.set_theme("dark" if theme == "dark" else "light")
             except Exception:
                 pass
 
@@ -164,6 +170,7 @@ class App:
         toolbar.pack(fill="x")
 
         ttk.Button(toolbar, text="Add files", command=self.add_files).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Add folder", command=self.add_folder).pack(side="left", padx=2)
         ttk.Button(toolbar, text="Remove", command=self.remove_selected).pack(side="left", padx=2)
         ttk.Button(toolbar, text="Clear", command=self.clear_files).pack(side="left", padx=2)
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
@@ -241,6 +248,9 @@ class App:
         self.tree.bind("<Double-1>", self._on_row_double_click)
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
         self.tree.bind("<Button-3>", self._on_right_click)
+        self.tree.bind("<ButtonPress-1>", self._on_tree_press, add="+")
+        self.tree.bind("<B1-Motion>", self._on_tree_drag, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_release, add="+")
 
         sb = ttk.Scrollbar(list_wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -297,6 +307,27 @@ class App:
             label="Prefer GPU encoding when available",
             variable=self.hw_var, command=self._on_hw_change,
         )
+        self.delete_after_var = tk.BooleanVar(
+            value=self.settings.get("delete_source_after_success")
+        )
+        edit_menu.add_checkbutton(
+            label="Delete source file after successful conversion",
+            variable=self.delete_after_var, command=self._on_delete_after_change,
+        )
+        edit_menu.add_separator()
+        saved_theme = self.settings.get("theme")
+        if saved_theme not in ("light", "dark"):
+            saved_theme = "light"
+        self.theme_var = tk.StringVar(value=saved_theme)
+        theme_state = "normal" if _HAS_SVTTK else "disabled"
+        edit_menu.add_radiobutton(
+            label="Light theme", variable=self.theme_var, value="light",
+            command=self._on_theme_change, state=theme_state,
+        )
+        edit_menu.add_radiobutton(
+            label="Dark theme", variable=self.theme_var, value="dark",
+            command=self._on_theme_change, state=theme_state,
+        )
         menubar.add_cascade(label="Settings", menu=edit_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -320,6 +351,8 @@ class App:
         paths = self.root.tk.splitlist(raw)
         self._add_paths([p for p in paths if os.path.isfile(p)])
 
+    SUPPORTED_EXTS = (".ts", ".m2ts", ".mts", ".mkv")
+
     def add_files(self):
         paths = filedialog.askopenfilenames(
             title="Select video files",
@@ -332,6 +365,23 @@ class App:
         )
         if paths:
             self._add_paths(list(paths))
+
+    def add_folder(self):
+        d = filedialog.askdirectory(title="Select a folder to scan for video files")
+        if not d:
+            return
+        found = []
+        for root, _, files in os.walk(d):
+            for f in files:
+                if f.lower().endswith(self.SUPPORTED_EXTS):
+                    found.append(os.path.join(root, f))
+        if not found:
+            messagebox.showinfo(
+                "Add folder",
+                f"No supported video files found under:\n{d}",
+            )
+            return
+        self._add_paths(found)
 
     def _add_paths(self, paths):
         existing = {str(j.src) for j in self.jobs}
@@ -354,6 +404,7 @@ class App:
             added += 1
         if added:
             self._refresh_button_state()
+            self._save_queue()
 
     def remove_selected(self):
         if self.is_running:
@@ -364,6 +415,7 @@ class App:
                 self.jobs.remove(job)
             self.tree.delete(iid)
         self._refresh_button_state()
+        self._save_queue()
 
     def clear_files(self):
         if self.is_running:
@@ -372,6 +424,7 @@ class App:
         self.jobs.clear()
         self.job_by_iid.clear()
         self._refresh_button_state()
+        self._clear_queue_file()
 
     def choose_output(self):
         d = filedialog.askdirectory(title="Select output folder")
@@ -410,6 +463,34 @@ class App:
         self.settings.set("prefer_hw", v)
         self.settings.save()
         self.converter.prefer_hw = v
+
+    def _on_theme_change(self):
+        theme = self.theme_var.get()
+        self.settings.set("theme", theme)
+        self.settings.save()
+        if _HAS_SVTTK:
+            try:
+                sv_ttk.set_theme(theme)
+            except Exception:
+                pass
+
+    def _on_delete_after_change(self):
+        v = self.delete_after_var.get()
+        if v and not self.settings.get("delete_source_warned"):
+            ok = messagebox.askokcancel(
+                "Delete source files?",
+                "When this is enabled, the original file is permanently deleted "
+                "after each successful conversion. It is NOT sent to the Recycle Bin.\n\n"
+                "Make sure your output folder and 'If exists' policy are set correctly "
+                "before running. Continue?",
+                icon="warning",
+            )
+            if not ok:
+                self.delete_after_var.set(False)
+                return
+            self.settings.set("delete_source_warned", True)
+        self.settings.set("delete_source_after_success", v)
+        self.settings.save()
 
     def _selected_mode(self) -> Mode:
         label = self.mode_var.get()
@@ -497,6 +578,14 @@ class App:
                 job.progress_pct = 100
                 with lock:
                     counts["done"] += 1
+                if (self.settings.get("delete_source_after_success")
+                        and job.out_path and job.out_path.exists()
+                        and job.out_path.resolve() != job.src.resolve()):
+                    try:
+                        job.src.unlink()
+                        job.stage = "Source deleted"
+                    except OSError:
+                        pass
             except CancelledError:
                 job.status = "Cancelled"
                 with lock:
@@ -553,6 +642,7 @@ class App:
             parts.append(f"{cancelled} cancelled")
         self.status_label.config(text="  •  ".join(parts))
         self._refresh_button_state()
+        self._save_queue()
 
     def _row_values(self, job: Job):
         if job.progress_pct >= 1 or job.status in ("Done", "Running"):
@@ -625,6 +715,41 @@ class App:
         if row:
             self.tree.selection_set(row)
             self.ctx_menu.post(event.x_root, event.y_root)
+
+    def _on_tree_press(self, event):
+        if self.is_running:
+            self._drag_iid = None
+            return
+        region = self.tree.identify_region(event.x, event.y)
+        if region not in ("cell", "tree"):
+            self._drag_iid = None
+            return
+        self._drag_iid = self.tree.identify_row(event.y)
+        self._drag_started = False
+
+    def _on_tree_drag(self, event):
+        if not self._drag_iid or self.is_running:
+            return
+        target = self.tree.identify_row(event.y)
+        if not target or target == self._drag_iid:
+            return
+        if not self._drag_started:
+            self._drag_started = True
+            self.tree.config(cursor="hand2")
+        self.tree.move(self._drag_iid, "", self.tree.index(target))
+
+    def _on_tree_release(self, _event):
+        if self._drag_started:
+            self.tree.config(cursor="")
+            new_order = []
+            for iid in self.tree.get_children():
+                job = self.job_by_iid.get(iid)
+                if job:
+                    new_order.append(job)
+            self.jobs = new_order
+            self._save_queue()
+        self._drag_iid = None
+        self._drag_started = False
 
     def open_output_file(self):
         sel = self.tree.selection()
@@ -717,6 +842,58 @@ class App:
         )
         messagebox.showinfo("About", msg)
 
+    def _queue_path(self) -> Path:
+        return get_config_dir() / "queue.json"
+
+    def _save_queue(self):
+        pending = [
+            {"src": str(j.src), "status": j.status}
+            for j in self.jobs if j.status != "Done"
+        ]
+        path = self._queue_path()
+        try:
+            if pending:
+                with open(path, "w", encoding="utf-8") as fp:
+                    json.dump({"version": 1, "files": pending}, fp, indent=2)
+            elif path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+    def _clear_queue_file(self):
+        try:
+            p = self._queue_path()
+            if p.exists():
+                p.unlink()
+        except OSError:
+            pass
+
+    def _load_queue_if_exists(self):
+        path = self._queue_path()
+        if not path.exists():
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except (OSError, json.JSONDecodeError):
+            self._clear_queue_file()
+            return
+        files = data.get("files", []) if isinstance(data, dict) else []
+        valid = [f["src"] for f in files
+                 if isinstance(f, dict) and f.get("src") and os.path.isfile(f["src"])]
+        if not valid:
+            self._clear_queue_file()
+            return
+        n = len(valid)
+        if messagebox.askyesno(
+            "Restore previous queue",
+            f"Found {n} file(s) from a previous session that didn't finish.\n\n"
+            f"Restore them to the queue?",
+        ):
+            self._add_paths(valid)
+        else:
+            self._clear_queue_file()
+
     def _on_close(self):
         if self.is_running:
             if not messagebox.askokcancel("Quit",
@@ -728,6 +905,7 @@ class App:
         try:
             self.settings.set("geometry", self.root.geometry())
             self.settings.save()
+            self._save_queue()
         except Exception:
             pass
         self.root.destroy()

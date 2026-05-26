@@ -1,14 +1,18 @@
 # TS to MP4 Converter
 
-A desktop app to batch-convert `.ts` (MPEG-TS) video files to `.mp4`, with GPU acceleration, drag-and-drop, parallel jobs, and automatic re-encode fallback for broken sources.
+A desktop app to batch-convert `.ts` / `.m2ts` / `.mts` / `.mkv` video files to `.mp4`, with GPU acceleration, drag-and-drop, parallel jobs, and automatic re-encode fallback for broken sources.
 
 ## Features
 
+- **Input formats**: `.ts`, `.m2ts`, `.mts`, `.mkv` — drop them in or use **Add files** / **Add folder** (recursive scan)
 - **Three modes**: Fast remux (instant), Auto (remux + re-encode fallback), or full Re-encode
 - **GPU acceleration** auto-detected: NVENC / Quick Sync / AMF
 - **Parallel conversion** (1–8 simultaneous jobs)
-- **Drag-and-drop** files into the window
-- **Handles broken TS files** — auto-falls-back to re-encode when remux stalls
+- **Drag-and-drop** files into the window; **drag-to-reorder** the queue
+- **Handles broken sources** — auto-falls-back to re-encode when remux stalls
+- **Crash-safe queue** — unfinished jobs restored on the next launch
+- **Optional**: delete the source file after a successful conversion
+- **Dark/light theme** toggle
 - **Cancel any time**, partial outputs cleaned up
 - **Per-file stats**: progress %, encoding speed, ETA
 - **Persistent settings** in `%APPDATA%\TSConverter\settings.json`
