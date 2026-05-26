@@ -21,6 +21,7 @@ from converter import (
     MODE_LABELS,
     Mode,
     detect_hw_encoders,
+    get_logs_dir,
 )
 
 try:
@@ -36,7 +37,7 @@ except ImportError:
     _HAS_SVTTK = False
 
 APP_NAME = "TS to MP4 Converter"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 SAME_AS_SOURCE = "(same folder as source)"
 
 
@@ -285,6 +286,7 @@ class App:
         self.ctx_menu = tk.Menu(self.root, tearoff=0)
         self.ctx_menu.add_command(label="Open output", command=self.open_output_file)
         self.ctx_menu.add_command(label="Show in folder", command=self.show_in_folder)
+        self.ctx_menu.add_command(label="Open log", command=self.open_log_file)
         self.ctx_menu.add_command(label="Inspect", command=self.inspect_selected)
         self.ctx_menu.add_separator()
         self.ctx_menu.add_command(label="Remove from list", command=self.remove_selected)
@@ -712,9 +714,16 @@ class App:
 
     def _on_right_click(self, event):
         row = self.tree.identify_row(event.y)
-        if row:
-            self.tree.selection_set(row)
-            self.ctx_menu.post(event.x_root, event.y_root)
+        if not row:
+            return
+        self.tree.selection_set(row)
+        job = self.job_by_iid.get(row)
+        log_state = "normal" if (job and job.log_path and job.log_path.exists()) else "disabled"
+        try:
+            self.ctx_menu.entryconfigure("Open log", state=log_state)
+        except tk.TclError:
+            pass
+        self.ctx_menu.post(event.x_root, event.y_root)
 
     def _on_tree_press(self, event):
         if self.is_running:
@@ -761,6 +770,23 @@ class App:
                 os.startfile(str(job.out_path))
             except OSError:
                 open_in_explorer(job.out_path)
+
+    def open_log_file(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        job = self.job_by_iid.get(sel[0])
+        if not job or not job.log_path or not job.log_path.exists():
+            messagebox.showinfo(
+                "Open log",
+                "No log is available for this file yet. "
+                "A log is written after each conversion attempt.",
+            )
+            return
+        try:
+            os.startfile(str(job.log_path))
+        except OSError:
+            open_in_explorer(job.log_path)
 
     def show_in_folder(self):
         sel = self.tree.selection()
@@ -832,13 +858,18 @@ class App:
     def _show_about(self):
         hw = detect_hw_encoders()
         hw_text = ", ".join(hw) if hw else "none detected"
+        try:
+            logs_path = str(get_logs_dir())
+        except Exception:
+            logs_path = "(unavailable)"
         msg = (
             f"{APP_NAME}\nVersion {APP_VERSION}\n\n"
             f"Python {sys.version.split()[0]}\n"
             f"Drag-and-drop: {'enabled' if _HAS_DND else 'disabled (pip install tkinterdnd2)'}\n"
             f"Modern theme: {'enabled' if _HAS_SVTTK else 'disabled (pip install sv-ttk)'}\n"
             f"Hardware encoders: {hw_text}\n\n"
-            f"Config: {Settings.PATH}"
+            f"Config: {Settings.PATH}\n"
+            f"Logs:   {logs_path}"
         )
         messagebox.showinfo("About", msg)
 

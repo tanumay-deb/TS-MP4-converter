@@ -11,6 +11,8 @@ A desktop app to batch-convert `.ts` / `.m2ts` / `.mts` / `.mkv` video files to 
 - **Drag-and-drop** files into the window; **drag-to-reorder** the queue
 - **Handles broken sources** — auto-falls-back to re-encode when remux stalls
 - **Crash-safe queue** — unfinished jobs restored on the next launch
+- **Output verification** — every conversion is probed afterwards to flag silently-broken outputs
+- **Per-file logs** saved to a `logs/` folder next to the app (right-click → **Open log**)
 - **Optional**: delete the source file after a successful conversion
 - **Dark/light theme** toggle
 - **Cancel any time**, partial outputs cleaned up

@@ -5,6 +5,8 @@ import os
 import queue
 import re
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -66,6 +68,10 @@ class Job:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
 
+    log_lines: list[str] = field(default_factory=list)
+    log_path: Optional[Path] = None
+    verify_message: Optional[str] = None
+
 
 class CancelledError(Exception):
     pass
@@ -80,6 +86,105 @@ class ConversionError(Exception):
 
 def hms_to_seconds(h, m, s):
     return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+_SAFE_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def get_logs_dir() -> Path:
+    """Resolve the ./logs/ folder next to the app.
+
+    For a PyInstaller --onefile build, that's next to the .exe.
+    For source runs, it's next to converter.py. Falls back to a temp dir
+    if the app folder is read-only.
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).resolve().parent
+    else:
+        base = Path(__file__).resolve().parent
+    candidate = base / "logs"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        # Confirm we can actually write here (read-only install location?)
+        probe = candidate / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return candidate
+    except OSError:
+        fallback = Path(tempfile.gettempdir()) / "TSConverter_logs"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def write_job_log(job: "Job") -> Optional[Path]:
+    """Flush job.log_lines to disk. Returns the log path or None."""
+    if not job.log_lines:
+        return None
+    try:
+        logs_dir = get_logs_dir()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        safe_stem = _SAFE_NAME_RE.sub("_", job.src.stem)[:80] or "job"
+        log_path = logs_dir / f"{safe_stem}_{timestamp}.log"
+        # If two jobs of the same file land in the same second, disambiguate.
+        n = 1
+        while log_path.exists():
+            log_path = logs_dir / f"{safe_stem}_{timestamp}_{n}.log"
+            n += 1
+        with open(log_path, "w", encoding="utf-8") as fp:
+            fp.write("\n".join(job.log_lines))
+            fp.write("\n")
+        return log_path
+    except OSError:
+        return None
+
+
+def verify_output(out_path: Path, expected_duration: float) -> tuple[bool, str]:
+    """Quick post-conversion probe. Sub-second on most files.
+
+    Checks: file exists with non-trivial size, container is parseable,
+    video stream present, duration within 2% (or 2s) of expected.
+    """
+    if not out_path.exists():
+        return False, "Output file does not exist"
+    try:
+        size = out_path.stat().st_size
+    except OSError as e:
+        return False, f"Could not stat output ({e})"
+    if size < 4096:
+        return False, f"Output is suspiciously small ({size} bytes)"
+    try:
+        proc = subprocess.run(
+            [FFMPEG_PATH, "-hide_banner", "-i", str(out_path)],
+            capture_output=True, text=True,
+            creationflags=CREATE_NO_WINDOW, timeout=30,
+        )
+        stderr = proc.stderr or ""
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"Probe failed ({type(e).__name__})"
+
+    low = stderr.lower()
+    for token in ("invalid data found", "moov atom not found",
+                  "could not find codec parameters", "error while decoding"):
+        if token in low:
+            return False, f"Output rejected by ffmpeg ({token})"
+    if "Stream #" not in stderr:
+        return False, "No streams found in output"
+    if "Video:" not in stderr:
+        return False, "No video stream in output"
+
+    m = DURATION_RE.search(stderr)
+    if m:
+        actual = hms_to_seconds(*m.groups())
+        if expected_duration > 0:
+            diff = abs(actual - expected_duration)
+            tolerance = max(2.0, expected_duration * 0.02)
+            if diff > tolerance:
+                return False, (
+                    f"Duration mismatch: expected {expected_duration:.1f}s, "
+                    f"got {actual:.1f}s"
+                )
+        return True, f"OK ({actual:.1f}s, {size / 1024 / 1024:.1f} MB)"
+    return True, f"OK ({size / 1024 / 1024:.1f} MB; duration not detected)"
 
 
 def extract_error(stderr: str) -> str:
@@ -167,53 +272,92 @@ class Converter:
         cancel_event: threading.Event,
     ):
         job.started_at = time.time()
+        job.log_lines = [
+            f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} ===",
+            f"Source:   {job.src}",
+            f"Mode:     {job.mode.value}",
+            f"Conflict: {job.conflict.value}",
+        ]
+        verify_ok = True
 
-        if cancel_event.is_set():
-            raise CancelledError()
+        try:
+            if cancel_event.is_set():
+                raise CancelledError()
 
-        if not job.duration:
-            job.stage = "Probing"
-            on_update()
-            d = probe_duration(job.src)
-            if d:
-                job.duration = d
-
-        job.out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = resolve_output_path(job.src, job.out_dir, job.conflict)
-        if out_path is None:
-            raise ConversionError("Output exists; skipped")
-        job.out_path = out_path
-
-        if cancel_event.is_set():
-            raise CancelledError()
-
-        if job.mode == Mode.REMUX:
-            self._remux(job, on_update, cancel_event)
-        elif job.mode == Mode.REENCODE:
-            self._reencode(job, on_update, cancel_event)
-        else:
-            try:
-                self._remux(job, on_update, cancel_event)
-            except ConversionError as e:
-                if cancel_event.is_set():
-                    raise CancelledError()
-                if job.out_path and job.out_path.exists():
-                    try:
-                        job.out_path.unlink()
-                    except OSError:
-                        pass
-                job.stage = "Re-encoding (remux failed, retrying)"
-                job.error = None
+            if not job.duration:
+                job.stage = "Probing"
                 on_update()
+                d = probe_duration(job.src)
+                if d:
+                    job.duration = d
+
+            job.log_lines.append(f"Duration: {job.duration:.1f}s")
+
+            job.out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = resolve_output_path(job.src, job.out_dir, job.conflict)
+            if out_path is None:
+                raise ConversionError("Output exists; skipped")
+            job.out_path = out_path
+            job.log_lines.append(f"Output:   {out_path}")
+
+            if cancel_event.is_set():
+                raise CancelledError()
+
+            if job.mode == Mode.REMUX:
+                self._remux(job, on_update, cancel_event)
+            elif job.mode == Mode.REENCODE:
+                self._reencode(job, on_update, cancel_event)
+            else:
                 try:
-                    self._reencode(job, on_update, cancel_event)
-                except ConversionError as e2:
+                    self._remux(job, on_update, cancel_event)
+                except ConversionError as e:
+                    if cancel_event.is_set():
+                        raise CancelledError()
+                    if job.out_path and job.out_path.exists():
+                        try:
+                            job.out_path.unlink()
+                        except OSError:
+                            pass
+                    job.stage = "Re-encoding (remux failed, retrying)"
+                    job.error = None
+                    job.log_lines.append(f"Remux failed: {e.short} — retrying with re-encode")
+                    on_update()
+                    try:
+                        self._reencode(job, on_update, cancel_event)
+                    except ConversionError as e2:
+                        raise ConversionError(
+                            e2.short,
+                            f"Remux failed: {e.full}\n\nRe-encode failed: {e2.full}",
+                        )
+
+            # Output verification (quick probe — sub-second on most files)
+            if not cancel_event.is_set() and job.out_path and job.out_path.exists():
+                job.stage = "Verifying output"
+                on_update()
+                ok, msg = verify_output(job.out_path, job.duration)
+                job.verify_message = msg
+                job.log_lines.append(f"Verify:   {msg}")
+                if not ok:
+                    verify_ok = False
                     raise ConversionError(
-                        e2.short,
-                        f"Remux failed: {e.full}\n\nRe-encode failed: {e2.full}",
+                        f"Verify failed: {msg}",
+                        f"Output file failed post-conversion verification.\n{msg}\n\n"
+                        f"The output file was kept at:\n{job.out_path}",
                     )
 
-        job.completed_at = time.time()
+            job.completed_at = time.time()
+            job.log_lines.append(
+                f"Done in {job.completed_at - job.started_at:.1f}s"
+            )
+        except CancelledError:
+            job.log_lines.append("CANCELLED")
+            raise
+        except ConversionError as e:
+            if verify_ok:
+                job.log_lines.append(f"FAILED: {e.short}")
+            raise
+        finally:
+            job.log_path = write_job_log(job)
 
     def _remux(self, job, on_update, cancel_event):
         is_ts_family = job.src.suffix.lower() in (".ts", ".m2ts", ".mts")
@@ -280,6 +424,11 @@ class Converter:
         job.seconds_done = 0.0
         job.speed = 0.0
         on_update()
+
+        job.log_lines.append(f"--- {stage} ---")
+        job.log_lines.append("Command: " + " ".join(
+            f'"{c}"' if " " in str(c) else str(c) for c in cmd
+        ))
 
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -388,6 +537,14 @@ class Converter:
             # Let reader threads drain so pipes close cleanly
             out_t.join(timeout=1)
             err_t.join(timeout=1)
+
+        job.log_lines.append(f"Exit code: {proc.returncode}")
+        if stderr_buf:
+            job.log_lines.append("--- ffmpeg stderr ---")
+            for raw in stderr_buf:
+                stripped = raw.rstrip()
+                if stripped:
+                    job.log_lines.append(stripped)
 
         if cancel_event.is_set():
             raise CancelledError()

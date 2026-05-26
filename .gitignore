@@ -29,4 +29,5 @@ desktop.ini
 
 # Local files
 *.log
+logs/
 .claude/
