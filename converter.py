@@ -203,10 +203,56 @@ def extract_error(stderr: str) -> str:
     return lines[-1]
 
 
+TS_SYNC = 0x47          # MPEG-TS packet sync byte
+TS_PACKET = 188         # standard transport stream packet size
+
+
+def detect_ts_offset(src: Path, scan_bytes: int = 65536, max_prefix: int = 4096) -> int:
+    """Return the byte offset where a junk-prefixed MPEG-TS stream really starts.
+
+    Some 'fake' .ts files have junk bytes (often a tiny PNG) prepended so that
+    ffmpeg sniffs the wrong format (e.g. png_pipe, a 1x1 image) and never finds
+    the video. The real transport stream begins at the first 0x47 sync byte that
+    recurs at the 188-byte packet stride. Returns 0 for clean files (the stream
+    already starts at byte 0) or if no transport stream is found.
+    """
+    try:
+        with open(src, "rb") as fp:
+            buf = fp.read(scan_bytes)
+    except OSError:
+        return 0
+    n = len(buf)
+    need = TS_PACKET * 2
+    if n < need + 1:
+        return 0
+    upper = min(max_prefix, n - need)
+    for off in range(upper + 1):
+        if (buf[off] == TS_SYNC
+                and buf[off + TS_PACKET] == TS_SYNC
+                and buf[off + 2 * TS_PACKET] == TS_SYNC):
+            return off
+    return 0
+
+
+def ts_input_opts(src: Path) -> list[str]:
+    """ffmpeg input options to handle a junk-prefixed .ts file.
+
+    Returns the options needed to skip the junk header and force the mpegts
+    demuxer, or an empty list for clean files (and non-.ts inputs, which are
+    left to ffmpeg's normal format detection).
+    """
+    if src.suffix.lower() != ".ts":
+        return []
+    offset = detect_ts_offset(src)
+    if offset > 0:
+        return ["-skip_initial_bytes", str(offset), "-f", "mpegts"]
+    return []
+
+
 def probe_duration(src: Path) -> Optional[float]:
     try:
         proc = subprocess.run(
-            [FFMPEG_PATH, "-hide_banner", "-i", str(src)],
+            [FFMPEG_PATH, "-hide_banner", *ts_input_opts(src), "-i", str(src)],
             capture_output=True, text=True,
             creationflags=CREATE_NO_WINDOW, timeout=30,
         )
@@ -361,12 +407,18 @@ class Converter:
 
     def _remux(self, job, on_update, cancel_event):
         is_ts_family = job.src.suffix.lower() in (".ts", ".m2ts", ".mts")
+        in_opts = ts_input_opts(job.src)
+        if in_opts:
+            job.log_lines.append(
+                f"Junk header detected — skipping {in_opts[1]} bytes, forcing mpegts demuxer"
+            )
         cmd = [
             FFMPEG_PATH, "-y",
             "-err_detect", "ignore_err",
             "-fflags", "+genpts+igndts+discardcorrupt",
             "-analyzeduration", "100M",
             "-probesize", "100M",
+            *in_opts,
             "-i", str(job.src),
             "-map", "0:v?", "-map", "0:a?",
             "-c", "copy",
@@ -387,6 +439,11 @@ class Converter:
     def _reencode(self, job, on_update, cancel_event):
         encoder = best_h264_encoder(self.prefer_hw)
         is_hw = encoder != "libx264"
+        in_opts = ts_input_opts(job.src)
+        if in_opts:
+            job.log_lines.append(
+                f"Junk header detected — skipping {in_opts[1]} bytes, forcing mpegts demuxer"
+            )
 
         cmd = [
             FFMPEG_PATH, "-y",
@@ -394,6 +451,7 @@ class Converter:
             "-fflags", "+genpts+igndts+discardcorrupt",
             "-analyzeduration", "100M",
             "-probesize", "100M",
+            *in_opts,
             "-i", str(job.src),
             "-map", "0:v?", "-map", "0:a?",
             "-c:v", encoder,
