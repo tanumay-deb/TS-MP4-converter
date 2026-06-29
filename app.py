@@ -37,7 +37,7 @@ except ImportError:
     _HAS_SVTTK = False
 
 APP_NAME = "TS to MP4 Converter"
-APP_VERSION = "1.2"
+APP_VERSION = "1.4"
 SAME_AS_SOURCE = "(same folder as source)"
 
 
@@ -942,7 +942,71 @@ class App:
         self.root.destroy()
 
 
+def run_selftest() -> int:
+    """Headless smoke test for CI and the frozen binary.
+
+    Verifies the bundled ffmpeg runs and the junk-header detection works,
+    without opening a window. Returns a process exit code.
+    """
+    import shutil
+    import tempfile
+    from converter import FFMPEG_PATH, detect_ts_offset, ts_input_opts, CREATE_NO_WINDOW
+
+    def emit(stream, text):
+        # In a --windowed PyInstaller build, sys.stdout/stderr are None.
+        try:
+            if stream is not None:
+                stream.write(text)
+                stream.flush()
+        except Exception:
+            pass
+
+    failures = []
+
+    # 1) bundled ffmpeg actually executes
+    try:
+        proc = subprocess.run(
+            [FFMPEG_PATH, "-hide_banner", "-version"],
+            capture_output=True, text=True,
+            creationflags=CREATE_NO_WINDOW, timeout=30,
+        )
+        if proc.returncode != 0 or "ffmpeg version" not in (proc.stdout or "").lower():
+            failures.append(f"ffmpeg did not report a version (exit {proc.returncode})")
+    except (OSError, subprocess.SubprocessError) as e:
+        failures.append(f"ffmpeg failed to run: {e}")
+
+    # 2) junk-header detection finds the real stream offset
+    d = Path(tempfile.mkdtemp(prefix="tsconv_selftest_"))
+    try:
+        junk = b"\x89PNG\r\n\x1a\n" + b"\x00" * 62          # 70-byte fake PNG header
+        ts = b"".join(bytes([0x47]) + b"\x00" * 187 for _ in range(5))
+        fake = d / "selftest.ts"
+        fake.write_bytes(junk + ts)
+        clean = d / "clean.ts"
+        clean.write_bytes(ts)
+        off_fake = detect_ts_offset(fake)
+        off_clean = detect_ts_offset(clean)
+        if off_fake != 70:
+            failures.append(f"detect_ts_offset(fake) != 70 (got {off_fake})")
+        if off_clean != 0:
+            failures.append(f"detect_ts_offset(clean) != 0 (got {off_clean})")
+        if ts_input_opts(fake)[:2] != ["-skip_initial_bytes", "70"]:
+            failures.append(f"ts_input_opts(fake) wrong: {ts_input_opts(fake)}")
+    except Exception as e:  # noqa: BLE001 - selftest must never crash, only report
+        failures.append(f"detection check raised: {e}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    if failures:
+        emit(sys.stderr, "SELFTEST FAILED:\n  " + "\n  ".join(failures) + "\n")
+        return 1
+    emit(sys.stdout, f"SELFTEST OK ({APP_NAME} {APP_VERSION})\n")
+    return 0
+
+
 def main():
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(run_selftest())
     if _HAS_DND:
         root = TkinterDnD.Tk()
     else:

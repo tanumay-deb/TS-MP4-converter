@@ -16,6 +16,8 @@ env/
 build/
 dist/
 *.spec
+# but track our build spec — CI builds from it (icon + collect-all)
+!TSConverter.spec
 
 # IDE
 .vscode/

@@ -10,6 +10,7 @@ A desktop app to batch-convert `.ts` / `.m2ts` / `.mts` / `.mkv` video files to 
 - **Parallel conversion** (1–8 simultaneous jobs)
 - **Drag-and-drop** files into the window; **drag-to-reorder** the queue
 - **Handles broken sources** — auto-falls-back to re-encode when remux stalls
+- **Handles fake/junk-prefixed `.ts`** — files with a bogus header (e.g. a 1×1 PNG glued in front of the real stream) are auto-detected and converted anyway
 - **Crash-safe queue** — unfinished jobs restored on the next launch
 - **Output verification** — every conversion is probed afterwards to flag silently-broken outputs
 - **Per-file logs** saved to a `logs/` folder next to the app (right-click → **Open log**)
@@ -21,10 +22,13 @@ A desktop app to batch-convert `.ts` / `.m2ts` / `.mts` / `.mkv` video files to 
 
 ## Install
 
-### Option 1 — Download the `.exe` (easiest)
+### Option 1 — Run the installer (zero-setup, recommended)
 
-1. Grab the latest `TSConverter.exe` from the [Releases](https://github.com/tanumay-deb/TS-MP4-converter/releases) page
-2. Double-click to run. No Python needed.
+1. Download `TSConverter-<version>-setup.exe` from the [Releases](https://github.com/tanumay-deb/TS-MP4-converter/releases) page
+2. Run it. It installs to your machine, adds a Start Menu (and optional desktop) shortcut, and registers an uninstaller.
+3. Launch from the Start Menu. **No Python and no ffmpeg install needed** — everything is bundled.
+
+Prefer not to install? Grab the standalone `TSConverter.exe` (or the `-portable.zip`) from the same page and just double-click it.
 
 ### Option 2 — Install with pipx (one-liner)
 
@@ -51,14 +55,27 @@ python app.py
 
 On Windows you can also just double-click `run.bat`.
 
-## Build the `.exe` yourself
+## Build it yourself
+
+Just the `.exe`:
 
 ```bash
 pip install -r requirements.txt pyinstaller
 build.bat
 ```
 
-Output: `dist\TSConverter.exe` (single file, ~80 MB, ffmpeg bundled inside).
+The `.exe` **and** the zero-setup installer (PowerShell; needs [Inno Setup 6](https://jrsoftware.org/isdl.php)):
+
+```powershell
+pip install -r requirements.txt pyinstaller pillow
+.\build.ps1 -Installer
+```
+
+Output: `dist\TSConverter.exe` (single file, ~40 MB, ffmpeg bundled inside) and
+`dist\installer\TSConverter-<version>-setup.exe`. `build.ps1` runs `TSConverter.exe --selftest`
+as a smoke check before packaging.
+
+Pushing a `vX.Y.Z` tag builds both on GitHub Actions and attaches them to the release automatically.
 
 ## How it works
 
@@ -77,10 +94,14 @@ pip install -e .
 ```
 
 Files:
-- `app.py` — Tkinter UI
+- `app.py` — Tkinter UI (`--selftest` runs a headless smoke check)
 - `converter.py` — conversion engine (no UI deps)
 - `pyproject.toml` — package config + entry points
-- `build.bat` — PyInstaller wrapper
+- `TSConverter.spec` — PyInstaller build spec
+- `build.bat` — PyInstaller wrapper (exe only)
+- `build.ps1` — exe + Inno Setup installer (`-Installer`), optional signing (`-Sign`)
+- `installer.iss` — Inno Setup script for the zero-setup installer
+- `.github/workflows/build.yml` — tag-triggered CI that builds + attaches release assets
 
 ## License
 
