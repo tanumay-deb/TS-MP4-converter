@@ -15,6 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from tsconverter import history, updater
+from tsconverter.media import thumbnail
 from tsconverter.media.handlers import REGISTRY, get_handler
 
 from converter import (
@@ -318,6 +319,7 @@ class App:
         self.ctx_menu.add_command(label="Open output", command=self.open_output_file)
         self.ctx_menu.add_command(label="Show in folder", command=self.show_in_folder)
         self.ctx_menu.add_command(label="Open log", command=self.open_log_file)
+        self.ctx_menu.add_command(label="Preview", command=self.preview_selected)
         self.ctx_menu.add_command(label="Inspect", command=self.inspect_selected)
         self.ctx_menu.add_separator()
         self.ctx_menu.add_command(label="Remove from list", command=self.remove_selected)
@@ -1020,6 +1022,38 @@ class App:
             return
         target = job.out_path if (job.out_path and job.out_path.exists()) else job.src
         open_in_explorer(target)
+
+    def preview_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Preview", "Select a file in the list first.")
+            return
+        job = self.job_by_iid.get(sel[0])
+        if not job:
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"Preview — {job.src.name}")
+        lbl = ttk.Label(win, text="Extracting thumbnail…", padding=20)
+        lbl.pack()
+
+        def work():
+            png = thumbnail.extract_thumbnail(job.src)
+            self.root.after(0, lambda: self._show_preview(win, lbl, png))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_preview(self, win, lbl, png):
+        if not win.winfo_exists():
+            return
+        if not png:
+            lbl.config(text="No preview available (audio-only or unreadable).")
+            return
+        try:
+            img = tk.PhotoImage(file=str(png))     # Tk 8.6 reads PNG natively
+        except Exception:
+            lbl.config(text="Could not load preview image.")
+            return
+        win._thumb_ref = img                       # keep a reference alive
+        lbl.config(image=img, text="")
 
     def inspect_selected(self):
         sel = self.tree.selection()
