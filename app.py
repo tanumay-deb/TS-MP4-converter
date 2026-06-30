@@ -1,7 +1,6 @@
 """TS to MP4 Converter — desktop app."""
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import os
 import subprocess
@@ -17,12 +16,12 @@ from typing import Optional
 from tsconverter import history, tray, updater
 from tsconverter.media import thumbnail
 from tsconverter.media.handlers import REGISTRY, get_handler
+from tsconverter.queue import QueueController
 
 from converter import (
     ConflictPolicy,
     Converter,
     Job,
-    JobStatus,
     MODE_LABELS,
     Mode,
     detect_hw_encoders,
@@ -146,12 +145,18 @@ class App:
         self.settings = Settings()
         self.jobs: list[Job] = []
         self.job_by_iid: dict[str, Job] = {}
-        self.cancel_event = threading.Event()
-        self.pause_event = threading.Event()
         self.is_running = False
-        self.worker: Optional[threading.Thread] = None
         self.converter = Converter(prefer_hw=self.settings.get("prefer_hw"))
         self.history = history.HistoryStore(get_config_dir() / "history.json")
+        self.queue = QueueController(
+            self.converter,
+            refresh=self._refresh_row,
+            record=self._record_history,
+            set_overall=self._set_overall,
+            finished=lambda d, f, c, t: self.root.after(0, lambda: self._finish(d, f, c, t)),
+            concurrency=lambda: int(self.settings.get("concurrency") or 2),
+            should_delete_source=lambda: bool(self.settings.get("delete_source_after_success")),
+        )
         self.tray: Optional[tray.Tray] = None
         self._tray_quit = False
         self._hidden = False
@@ -596,8 +601,6 @@ class App:
             self._refresh_row(j)
 
         self.is_running = True
-        self.cancel_event.clear()
-        self.pause_event.clear()
         self.start_btn.config(state="disabled")
         self.retry_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
@@ -605,104 +608,13 @@ class App:
         self.status_label.config(text="Converting...")
         self.overall_progress.config(value=0)
 
-        self.worker = threading.Thread(target=self._run_jobs, daemon=True)
-        self.worker.start()
-
-    def _run_jobs(self):
         pending = [j for j in self.jobs if j.status != "Done"]
-        total = len(pending)
-        if total == 0:
-            self.root.after(0, lambda: self._finish(0, 0, 0, 0))
-            return
-
-        n_workers = max(1, min(8, int(self.settings.get("concurrency") or 2)))
-        n_workers = min(n_workers, total)
-
-        counts = {"done": 0, "fail": 0, "cancel": 0, "completed": 0}
-        lock = threading.Lock()
-
-        def update_overall():
-            with lock:
-                pct = counts["completed"] / total * 100
-            self._set_overall(pct)
-
-        def worker(job: Job):
-            # Queue-level pause: a not-yet-started job waits here while paused.
-            # Jobs already running keep going; only new starts are held back.
-            while self.pause_event.is_set() and not self.cancel_event.is_set():
-                if job.status != "Paused":
-                    job.status = "Paused"
-                    self._refresh_row(job)
-                time.sleep(0.2)
-
-            if self.cancel_event.is_set():
-                job.status = JobStatus.CANCELLED.value
-                self._refresh_row(job)
-                with lock:
-                    counts["cancel"] += 1
-                    counts["completed"] += 1
-                update_overall()
-                return
-
-            job.status = "Running"
-            self._refresh_row(job)
-
-            def on_progress(ev, j=job):
-                j.apply_progress(ev)
-                self._refresh_row(j)
-
-            # The engine is pure: it returns a result, the controller maps it
-            # onto the Job view-model here (the single place Job is mutated).
-            # pause_event also suspends this job's ffmpeg if paused mid-run.
-            result = self.converter.convert(
-                job.to_request(), on_progress, self.cancel_event, self.pause_event)
-            job.apply_result(result)
-            if result.status in (JobStatus.DONE, JobStatus.FAILED):
-                self._record_history(job, result)
-
-            if result.status == JobStatus.DONE:
-                with lock:
-                    counts["done"] += 1
-                if (self.settings.get("delete_source_after_success")
-                        and job.out_path and job.out_path.exists()
-                        and job.out_path.resolve() != job.src.resolve()):
-                    try:
-                        job.src.unlink()
-                        job.stage = "Source deleted"
-                    except OSError:
-                        pass
-            elif result.status == JobStatus.CANCELLED:
-                with lock:
-                    counts["cancel"] += 1
-                if job.out_path and job.out_path.exists():
-                    try:
-                        job.out_path.unlink()
-                    except OSError:
-                        pass
-            else:  # FAILED / SKIPPED
-                with lock:
-                    counts["fail"] += 1
-
-            self._refresh_row(job)
-            with lock:
-                counts["completed"] += 1
-            update_overall()
-
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=n_workers, thread_name_prefix="ffmpeg-worker"
-        ) as pool:
-            list(pool.map(worker, pending))
-
-        self.root.after(
-            0,
-            lambda: self._finish(counts["done"], counts["fail"], counts["cancel"], total),
-        )
+        self.queue.start(pending)
 
     def cancel_all(self):
         if not self.is_running:
             return
-        self.cancel_event.set()
-        self.pause_event.clear()          # let any paused workers proceed to cancel
+        self.queue.cancel()
         self.cancel_btn.config(state="disabled")
         self.pause_btn.config(state="disabled", text="Pause")
         self.status_label.config(text="Cancelling...")
@@ -710,19 +622,15 @@ class App:
     def toggle_pause(self):
         if not self.is_running:
             return
-        if self.pause_event.is_set():
-            self.pause_event.clear()
-            self.pause_btn.config(text="Pause")
-            self.status_label.config(text="Converting...")
-        else:
-            self.pause_event.set()
+        if self.queue.toggle_pause():
             self.pause_btn.config(text="Resume")
             self.status_label.config(text="Paused (running jobs suspended; new ones held)")
+        else:
+            self.pause_btn.config(text="Pause")
+            self.status_label.config(text="Converting...")
 
     def _finish(self, success, failed, cancelled, total):
         self.is_running = False
-        self.cancel_event.clear()
-        self.pause_event.clear()
         self.start_btn.config(state="normal")
         self.cancel_btn.config(state="disabled")
         self.pause_btn.config(state="disabled", text="Pause")
@@ -1244,10 +1152,8 @@ class App:
                                           "A conversion is running. Cancel and quit?"):
                 self._tray_quit = False
                 return
-            self.cancel_event.set()
-            self.pause_event.clear()
-            if self.worker:
-                self.worker.join(timeout=3)
+            self.queue.cancel()
+            self.queue.join(timeout=3)
         if self.tray:
             self.tray.stop()
             self.tray = None
