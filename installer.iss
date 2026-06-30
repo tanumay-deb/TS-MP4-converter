@@ -40,8 +40,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"
 
 [Files]
-; the single PyInstaller --onefile binary (ffmpeg bundled inside)
-Source: "dist\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+; the whole PyInstaller onedir tree (TSConverter.exe + _internal\ with ffmpeg etc.)
+Source: "dist\TSConverter\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

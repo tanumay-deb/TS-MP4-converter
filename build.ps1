@@ -94,7 +94,7 @@ Write-Host "==> Building with PyInstaller" -ForegroundColor Cyan
 python -m PyInstaller --noconfirm --clean @upxArgs TSConverter.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed" }
 
-$exe = "dist\TSConverter.exe"
+$exe = "dist\TSConverter\TSConverter.exe"   # onedir layout
 if (-not (Test-Path $exe)) { throw "expected $exe was not produced" }
 
 Write-Host "==> Smoke-testing the frozen binary" -ForegroundColor Cyan

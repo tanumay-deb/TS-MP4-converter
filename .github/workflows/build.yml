@@ -54,11 +54,9 @@ jobs:
       - name: Package a portable zip
         shell: pwsh
         run: |
-          $stage = "dist\portable"
-          New-Item -ItemType Directory -Force $stage | Out-Null
-          Copy-Item "dist\TSConverter.exe" $stage
-          Copy-Item "README.md","LICENSE" $stage -ErrorAction SilentlyContinue
-          Compress-Archive -Path "$stage\*" -DestinationPath "dist\TSConverter-${{ steps.ver.outputs.version }}-portable.zip" -Force
+          # onedir build: zip the whole app folder (exe + _internal\ with ffmpeg).
+          Copy-Item "README.md","LICENSE" "dist\TSConverter" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "dist\TSConverter\*" -DestinationPath "dist\TSConverter-${{ steps.ver.outputs.version }}-portable.zip" -Force
 
       - name: Attach assets to the GitHub Release
         uses: softprops/action-gh-release@v2
@@ -68,4 +66,3 @@ jobs:
           files: |
             dist/installer/*.exe
             dist/TSConverter-*-portable.zip
-            dist/TSConverter.exe
