@@ -16,6 +16,10 @@ env/
 build/
 dist/
 *.spec
+
+# Downloaded at build time (shared ffmpeg/ffprobe, UPX), never committed
+bin/
+tools/
 # but track our build spec — CI builds from it (icon + collect-all)
 !TSConverter.spec
 
