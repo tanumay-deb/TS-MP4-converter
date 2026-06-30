@@ -7,10 +7,14 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
+
+from tsconverter import updater
 
 from converter import (
     ConflictPolicy,
@@ -63,6 +67,8 @@ class Settings:
         "geometry": "880x600",
         "delete_source_after_success": False,
         "delete_source_warned": False,
+        "check_updates": True,
+        "skip_update_version": "",
     }
 
     def __init__(self):
@@ -137,6 +143,7 @@ class App:
         self.jobs: list[Job] = []
         self.job_by_iid: dict[str, Job] = {}
         self.cancel_event = threading.Event()
+        self.pause_event = threading.Event()
         self.is_running = False
         self.worker: Optional[threading.Thread] = None
         self.converter = Converter(prefer_hw=self.settings.get("prefer_hw"))
@@ -148,6 +155,8 @@ class App:
         self._enable_dnd()
         self._refresh_button_state()
         self.root.after(200, self._load_queue_if_exists)
+        if self.settings.get("check_updates"):
+            self.root.after(1500, lambda: self._check_updates_async(manual=False))
 
     def _setup_window(self):
         self.root.title(APP_NAME)
@@ -173,6 +182,8 @@ class App:
         ttk.Button(toolbar, text="Add folder", command=self.add_folder).pack(side="left", padx=2)
         ttk.Button(toolbar, text="Remove", command=self.remove_selected).pack(side="left", padx=2)
         ttk.Button(toolbar, text="Clear", command=self.clear_files).pack(side="left", padx=2)
+        self.retry_btn = ttk.Button(toolbar, text="Retry failed", command=self.retry_failed)
+        self.retry_btn.pack(side="left", padx=2)
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(toolbar, text="Inspect", command=self.inspect_selected).pack(side="left", padx=2)
         ttk.Button(toolbar, text="Show in folder", command=self.show_in_folder).pack(side="left", padx=2)
@@ -259,7 +270,7 @@ class App:
 
         # Drop hint overlay
         if _HAS_DND:
-            hint = ttk.Label(self.root, text="Tip: drag .ts, .m2ts, or .mkv files into the window",
+            hint = ttk.Label(self.root, text="Tip: drag .ts / .mkv / .mp4 / .mov … video files into the window",
                              foreground="#888", padding=(10, 0))
             hint.pack(fill="x")
 
@@ -277,6 +288,9 @@ class App:
 
         self.cancel_btn = ttk.Button(bot_row, text="Cancel", command=self.cancel_all, state="disabled")
         self.cancel_btn.pack(side="right", padx=2)
+
+        self.pause_btn = ttk.Button(bot_row, text="Pause", command=self.toggle_pause, state="disabled")
+        self.pause_btn.pack(side="right", padx=2)
 
         self.start_btn = ttk.Button(bot_row, text="Start", command=self.start, style="Accent.TButton")
         self.start_btn.pack(side="right", padx=2)
@@ -332,6 +346,14 @@ class App:
         menubar.add_cascade(label="Settings", menu=edit_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Check for updates...",
+                              command=lambda: self._check_updates_async(manual=True))
+        self.check_updates_var = tk.BooleanVar(value=self.settings.get("check_updates"))
+        help_menu.add_checkbutton(
+            label="Check for updates on startup",
+            variable=self.check_updates_var, command=self._on_check_updates_change,
+        )
+        help_menu.add_separator()
         help_menu.add_command(label="About", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
 
@@ -352,15 +374,17 @@ class App:
         paths = self.root.tk.splitlist(raw)
         self._add_paths([p for p in paths if os.path.isfile(p)])
 
-    SUPPORTED_EXTS = (".ts", ".m2ts", ".mts", ".mkv")
+    SUPPORTED_EXTS = (".ts", ".m2ts", ".mts", ".mkv", ".mp4", ".mov", ".avi",
+                      ".flv", ".webm", ".wmv", ".m4v", ".mpg", ".mpeg")
 
     def add_files(self):
         paths = filedialog.askopenfilenames(
             title="Select video files",
             filetypes=[
-                ("Video files", "*.ts *.m2ts *.mts *.mkv"),
+                ("Video files", "*.ts *.m2ts *.mts *.mkv *.mp4 *.mov *.avi "
+                                "*.flv *.webm *.wmv *.m4v *.mpg *.mpeg"),
                 ("MPEG-TS files", "*.ts *.m2ts *.mts"),
-                ("Matroska files", "*.mkv"),
+                ("Matroska / WebM", "*.mkv *.webm"),
                 ("All files", "*.*"),
             ],
         )
@@ -532,8 +556,11 @@ class App:
 
         self.is_running = True
         self.cancel_event.clear()
+        self.pause_event.clear()
         self.start_btn.config(state="disabled")
+        self.retry_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
+        self.pause_btn.config(state="normal", text="Pause")
         self.status_label.config(text="Converting...")
         self.overall_progress.config(value=0)
 
@@ -559,6 +586,14 @@ class App:
             self._set_overall(pct)
 
         def worker(job: Job):
+            # Queue-level pause: a not-yet-started job waits here while paused.
+            # Jobs already running keep going; only new starts are held back.
+            while self.pause_event.is_set() and not self.cancel_event.is_set():
+                if job.status != "Paused":
+                    job.status = "Paused"
+                    self._refresh_row(job)
+                time.sleep(0.2)
+
             if self.cancel_event.is_set():
                 job.status = JobStatus.CANCELLED.value
                 self._refresh_row(job)
@@ -622,14 +657,30 @@ class App:
         if not self.is_running:
             return
         self.cancel_event.set()
+        self.pause_event.clear()          # let any paused workers proceed to cancel
         self.cancel_btn.config(state="disabled")
+        self.pause_btn.config(state="disabled", text="Pause")
         self.status_label.config(text="Cancelling...")
+
+    def toggle_pause(self):
+        if not self.is_running:
+            return
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            self.pause_btn.config(text="Pause")
+            self.status_label.config(text="Converting...")
+        else:
+            self.pause_event.set()
+            self.pause_btn.config(text="Resume")
+            self.status_label.config(text="Paused (running jobs finish; new ones held)")
 
     def _finish(self, success, failed, cancelled, total):
         self.is_running = False
         self.cancel_event.clear()
+        self.pause_event.clear()
         self.start_btn.config(state="normal")
         self.cancel_btn.config(state="disabled")
+        self.pause_btn.config(state="disabled", text="Pause")
         parts = [f"{success}/{total} done"]
         if failed:
             parts.append(f"{failed} failed")
@@ -638,6 +689,61 @@ class App:
         self.status_label.config(text="  •  ".join(parts))
         self._refresh_button_state()
         self._save_queue()
+
+    def retry_failed(self):
+        """Re-queue every Failed job and run them again."""
+        if self.is_running:
+            return
+        retried = 0
+        for j in self.jobs:
+            if j.status == "Failed":
+                j.status = "Queued"
+                j.stage = ""
+                j.error = None
+                j.error_full = None
+                j.progress_pct = 0
+                j.seconds_done = 0
+                j.speed = 0
+                j.eta_seconds = 0
+                self._refresh_row(j)
+                retried += 1
+        if retried:
+            self.start()
+        else:
+            self._refresh_button_state()
+
+    def _on_check_updates_change(self):
+        self.settings.set("check_updates", bool(self.check_updates_var.get()))
+        self.settings.save()
+
+    def _check_updates_async(self, manual=False):
+        def work():
+            info = updater.check_for_update(APP_VERSION)
+            self.root.after(0, lambda: self._on_update_result(info, manual))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_result(self, info, manual):
+        if info is None:
+            if manual:
+                messagebox.showinfo(
+                    "Check for updates",
+                    f"You're on the latest version (v{APP_VERSION}).",
+                )
+            return
+        if (not manual) and info.version == self.settings.get("skip_update_version"):
+            return
+        choice = messagebox.askyesnocancel(
+            "Update available",
+            f"{APP_NAME} {info.tag} is available — you have v{APP_VERSION}.\n\n"
+            f"Yes — open the download page\n"
+            f"No — remind me later\n"
+            f"Cancel — skip this version",
+        )
+        if choice is True:
+            webbrowser.open(info.url)
+        elif choice is None:            # Cancel = skip this version
+            self.settings.set("skip_update_version", info.version)
+            self.settings.save()
 
     def _row_values(self, job: Job):
         if job.progress_pct >= 1 or job.status in ("Done", "Running"):
@@ -689,6 +795,8 @@ class App:
     def _refresh_button_state(self):
         has_jobs = bool(self.jobs)
         self.start_btn.config(state="normal" if has_jobs and not self.is_running else "disabled")
+        has_failed = any(j.status == "Failed" for j in self.jobs)
+        self.retry_btn.config(state="normal" if has_failed and not self.is_running else "disabled")
 
     def _on_row_double_click(self, _event):
         sel = self.tree.selection()
