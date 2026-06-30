@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ts-mp4-converter"
 version = "1.6.1"
-description = "Desktop app to batch-convert .ts / .m2ts / .mkv video files to .mp4, with GPU acceleration."
+description = "Desktop app to batch-convert video to MP4/MKV/MOV/WebM or extract audio to MP3/M4A/WAV/FLAC/Opus, with GPU acceleration and bundled ffmpeg."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
-keywords = ["video", "ts", "mp4", "ffmpeg", "converter", "remux", "transcode"]
+keywords = ["video", "audio", "ts", "mp4", "mp3", "ffmpeg", "converter", "remux", "transcode"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Win32 (MS Windows)",
