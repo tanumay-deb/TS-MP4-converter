@@ -14,7 +14,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-from tsconverter import updater
+from tsconverter import history, updater
 
 from converter import (
     ConflictPolicy,
@@ -147,6 +147,7 @@ class App:
         self.is_running = False
         self.worker: Optional[threading.Thread] = None
         self.converter = Converter(prefer_hw=self.settings.get("prefer_hw"))
+        self.history = history.HistoryStore(get_config_dir() / "history.json")
         self._drag_iid: Optional[str] = None
         self._drag_started: bool = False
 
@@ -311,6 +312,8 @@ class App:
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Add files...", command=self.add_files, accelerator="Ctrl+O")
         file_menu.add_command(label="Clear list", command=self.clear_files)
+        file_menu.add_separator()
+        file_menu.add_command(label="Conversion history...", command=self.show_history)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_close)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -614,6 +617,8 @@ class App:
             # onto the Job view-model here (the single place Job is mutated).
             result = self.converter.convert(job.to_request(), on_progress, self.cancel_event)
             job.apply_result(result)
+            if result.status in (JobStatus.DONE, JobStatus.FAILED):
+                self._record_history(job, result)
 
             if result.status == JobStatus.DONE:
                 with lock:
@@ -744,6 +749,97 @@ class App:
         elif choice is None:            # Cancel = skip this version
             self.settings.set("skip_update_version", info.version)
             self.settings.save()
+
+    def _record_history(self, job: Job, result):
+        out = str(job.out_path) if job.out_path else ""
+        size = 0
+        try:
+            if job.out_path and job.out_path.exists():
+                size = job.out_path.stat().st_size
+        except OSError:
+            pass
+        self.history.add(history.HistoryEntry(
+            timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+            src=str(job.src),
+            out=out,
+            result=result.status.value,
+            encoder=result.used_encoder,
+            duration=result.duration or job.duration,
+            size=size,
+            error=result.error,
+        ))
+
+    def show_history(self):
+        entries = self.history.all()
+        win = tk.Toplevel(self.root)
+        win.title("Conversion history")
+        win.geometry("900x460")
+
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="both", expand=True)
+
+        cols = ("when", "file", "result", "info", "length", "size")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+        for key, label, width, anchor in (
+            ("when", "When", 140, "w"),
+            ("file", "File", 250, "w"),
+            ("result", "Result", 80, "w"),
+            ("info", "Encoder", 90, "w"),
+            ("length", "Length", 80, "e"),
+            ("size", "Output size", 100, "e"),
+        ):
+            tree.heading(key, text=label)
+            tree.column(key, width=width, anchor=anchor)
+        tree.tag_configure("Failed", foreground="#b00020")
+        tree.tag_configure("Done", foreground="#0a7d29")
+
+        rows: dict[str, history.HistoryEntry] = {}
+        for i, e in enumerate(entries):
+            iid = str(i)
+            rows[iid] = e
+            tree.insert("", "end", iid=iid, tags=(e.result,), values=(
+                e.timestamp,
+                Path(e.src).name if e.src else "",
+                e.result,
+                e.encoder or "",
+                fmt_duration(e.duration),
+                fmt_size(e.size) if e.size else "",
+            ))
+        sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        if not entries:
+            ttk.Label(frame, text="No conversions recorded yet.",
+                      foreground="#888").place(relx=0.5, rely=0.5, anchor="center")
+
+        def on_open(_e=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            entry = rows.get(sel[0])
+            if not entry:
+                return
+            if entry.result == "Done" and entry.out and Path(entry.out).exists():
+                try:
+                    os.startfile(entry.out)
+                except OSError:
+                    open_in_explorer(Path(entry.out))
+            elif entry.error:
+                self._show_text_dialog(f"Error — {Path(entry.src).name}", entry.error)
+        tree.bind("<Double-1>", on_open)
+
+        btns = ttk.Frame(win, padding=(10, 0, 10, 10))
+        btns.pack(fill="x")
+
+        def do_clear():
+            if messagebox.askyesno("Clear history", "Remove all history entries?"):
+                self.history.clear()
+                tree.delete(*tree.get_children())
+                rows.clear()
+        ttk.Button(btns, text="Clear history", command=do_clear).pack(side="left")
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
 
     def _row_values(self, job: Job):
         if job.progress_pct >= 1 or job.status in ("Done", "Running"):
