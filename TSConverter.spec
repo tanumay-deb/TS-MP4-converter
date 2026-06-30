@@ -48,19 +48,19 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# onedir build: the exe stays small and binaries/datas sit beside it, so the
+# installed app launches without re-extracting ~79MB to temp on every run.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='TSConverter',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -68,4 +68,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=_ICON if os.path.exists(_ICON) else None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='TSConverter',
 )

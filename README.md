@@ -29,7 +29,7 @@ A desktop app to batch-convert video files to MP4 (or MKV / MOV / WebM, or extra
 2. Run it. It installs to your machine, adds a Start Menu (and optional desktop) shortcut, and registers an uninstaller.
 3. Launch from the Start Menu. **No Python and no ffmpeg install needed** — everything is bundled.
 
-Prefer not to install? Grab the standalone `TSConverter.exe` (or the `-portable.zip`) from the same page and just double-click it.
+Prefer not to install? Grab the `-portable.zip` from the same page, unzip it anywhere, and run `TSConverter.exe` from the folder.
 
 ### Option 2 — Install with pipx (one-liner)
 
@@ -75,8 +75,9 @@ The `.exe` **and** the zero-setup installer (needs [Inno Setup 6](https://jrsoft
 .\build.ps1 -Installer
 ```
 
-Output: `dist\TSConverter.exe` (single file, ~75 MB — ffmpeg **and** ffprobe bundled
-inside) and `dist\installer\TSConverter-<version>-setup.exe`.
+Output: `dist\TSConverter\` (an app folder — `TSConverter.exe` plus an `_internal\`
+folder with ffmpeg, ffprobe and the rest) and `dist\installer\TSConverter-<version>-setup.exe`.
+The onedir layout launches instantly (no per-run extraction).
 
 Pushing a `vX.Y.Z` tag builds both on GitHub Actions and attaches them to the release automatically.
 
