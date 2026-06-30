@@ -14,14 +14,17 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
-try:
-    import imageio_ffmpeg
-    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-except ImportError:
-    FFMPEG_PATH = "ffmpeg"
+# Binary resolution, probing and HW detection now live in the tsconverter
+# package. Re-exported here so existing `from converter import ...` users keep
+# working during the incremental refactor.
+from tsconverter.media import hwaccel
+from tsconverter.media.ffmpeg import (  # noqa: F401  (re-exported)
+    CREATE_NO_WINDOW,
+    FFMPEG_PATH,
+    FFPROBE_PATH,
+)
+from tsconverter.media.probe import probe as probe_media
 
-CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
 _CTX_PREFIX_RE = re.compile(r"^\[[^\]]+@\s*[0-9a-fx]+\]\s*", re.IGNORECASE)
 
 
@@ -84,10 +87,6 @@ class ConversionError(Exception):
         self.full = full or short
 
 
-def hms_to_seconds(h, m, s):
-    return int(h) * 3600 + int(m) * 60 + float(s)
-
-
 _SAFE_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -138,11 +137,13 @@ def write_job_log(job: "Job") -> Optional[Path]:
         return None
 
 
-def verify_output(out_path: Path, expected_duration: float) -> tuple[bool, str]:
+def verify_output(out_path: Path, expected_duration: float,
+                  expect_video: bool = True) -> tuple[bool, str]:
     """Quick post-conversion probe. Sub-second on most files.
 
-    Checks: file exists with non-trivial size, container is parseable,
-    video stream present, duration within 2% (or 2s) of expected.
+    Checks: file exists with non-trivial size, container is parseable, the
+    expected stream kind is present, duration within 2% (or 2s) of expected.
+    `expect_video=False` is used by audio-only targets (M2).
     """
     if not out_path.exists():
         return False, "Output file does not exist"
@@ -152,39 +153,28 @@ def verify_output(out_path: Path, expected_duration: float) -> tuple[bool, str]:
         return False, f"Could not stat output ({e})"
     if size < 4096:
         return False, f"Output is suspiciously small ({size} bytes)"
-    try:
-        proc = subprocess.run(
-            [FFMPEG_PATH, "-hide_banner", "-i", str(out_path)],
-            capture_output=True, text=True,
-            creationflags=CREATE_NO_WINDOW, timeout=30,
-        )
-        stderr = proc.stderr or ""
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return False, f"Probe failed ({type(e).__name__})"
 
-    low = stderr.lower()
-    for token in ("invalid data found", "moov atom not found",
-                  "could not find codec parameters", "error while decoding"):
-        if token in low:
-            return False, f"Output rejected by ffmpeg ({token})"
-    if "Stream #" not in stderr:
-        return False, "No streams found in output"
-    if "Video:" not in stderr:
+    info = probe_media(out_path)
+    if not info.ok:
+        return False, "Output is not a readable media file (no streams found)"
+    if expect_video and not info.has_video:
         return False, "No video stream in output"
+    if not expect_video and not info.has_audio:
+        return False, "No audio stream in output"
 
-    m = DURATION_RE.search(stderr)
-    if m:
-        actual = hms_to_seconds(*m.groups())
-        if expected_duration > 0:
-            diff = abs(actual - expected_duration)
-            tolerance = max(2.0, expected_duration * 0.02)
-            if diff > tolerance:
-                return False, (
-                    f"Duration mismatch: expected {expected_duration:.1f}s, "
-                    f"got {actual:.1f}s"
-                )
-        return True, f"OK ({actual:.1f}s, {size / 1024 / 1024:.1f} MB)"
-    return True, f"OK ({size / 1024 / 1024:.1f} MB; duration not detected)"
+    mb = size / 1024 / 1024
+    actual = info.duration
+    if actual and expected_duration > 0:
+        diff = abs(actual - expected_duration)
+        tolerance = max(2.0, expected_duration * 0.02)
+        if diff > tolerance:
+            return False, (
+                f"Duration mismatch: expected {expected_duration:.1f}s, "
+                f"got {actual:.1f}s"
+            )
+    if actual:
+        return True, f"OK ({actual:.1f}s, {mb:.1f} MB)"
+    return True, f"OK ({mb:.1f} MB; duration not detected)"
 
 
 def extract_error(stderr: str) -> str:
@@ -250,45 +240,18 @@ def ts_input_opts(src: Path) -> list[str]:
 
 
 def probe_duration(src: Path) -> Optional[float]:
-    try:
-        proc = subprocess.run(
-            [FFMPEG_PATH, "-hide_banner", *ts_input_opts(src), "-i", str(src)],
-            capture_output=True, text=True,
-            creationflags=CREATE_NO_WINDOW, timeout=30,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    m = DURATION_RE.search(proc.stderr or "")
-    return hms_to_seconds(*m.groups()) if m else None
-
-
-_HW_CACHE: Optional[list[str]] = None
+    skip = detect_ts_offset(src) if src.suffix.lower() == ".ts" else 0
+    info = probe_media(src, skip_bytes=skip)
+    return info.duration or None
 
 
 def detect_hw_encoders() -> list[str]:
-    global _HW_CACHE
-    if _HW_CACHE is not None:
-        return _HW_CACHE
-    try:
-        proc = subprocess.run(
-            [FFMPEG_PATH, "-hide_banner", "-encoders"],
-            capture_output=True, text=True,
-            creationflags=CREATE_NO_WINDOW, timeout=10,
-        )
-        out = proc.stdout or ""
-    except (subprocess.TimeoutExpired, OSError):
-        out = ""
-    candidates = ["h264_nvenc", "h264_qsv", "h264_amf"]
-    _HW_CACHE = [c for c in candidates if c in out]
-    return _HW_CACHE
+    """H.264 hardware encoders that actually work (verified by test-encode)."""
+    return hwaccel.working_hw_encoders()
 
 
 def best_h264_encoder(prefer_hw: bool = True) -> str:
-    if prefer_hw:
-        hw = detect_hw_encoders()
-        if hw:
-            return hw[0]
-    return "libx264"
+    return hwaccel.best_h264_encoder(prefer_hw)
 
 
 def resolve_output_path(src: Path, out_dir: Path, policy: ConflictPolicy) -> Optional[Path]:
