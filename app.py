@@ -997,6 +997,24 @@ def run_selftest() -> int:
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+    # 3) ffprobe — bundled in release (frozen) builds; optional in dev
+    from tsconverter.media.ffmpeg import FFPROBE_PATH
+    if FFPROBE_PATH:
+        try:
+            p = subprocess.run(
+                [FFPROBE_PATH, "-hide_banner", "-version"],
+                capture_output=True, text=True,
+                creationflags=CREATE_NO_WINDOW, timeout=30,
+            )
+            if p.returncode != 0 or "ffprobe version" not in (p.stdout or "").lower():
+                failures.append(f"ffprobe resolved but gave no version (exit {p.returncode})")
+        except (OSError, subprocess.SubprocessError) as e:
+            failures.append(f"ffprobe failed to run: {e}")
+    elif getattr(sys, "frozen", False):
+        failures.append("no ffprobe bundled in the frozen build")
+    else:
+        emit(sys.stdout, "note: no ffprobe resolved; dev uses ffmpeg fallback\n")
+
     if failures:
         emit(sys.stderr, "SELFTEST FAILED:\n  " + "\n  ".join(failures) + "\n")
         return 1

@@ -32,11 +32,66 @@ if (-not (Test-Path "assets\icon.ico")) {
     }
 }
 
+Write-Host "==> Ensuring bundled ffmpeg + ffprobe (shared build)" -ForegroundColor Cyan
+# imageio-ffmpeg ships only ffmpeg. Bundle a pinned GPL *shared* build instead,
+# which includes ffprobe and the encoders we need (libx264, libmp3lame). Small
+# exes + shared DLLs keep the size far below a standalone static ffprobe.
+$ffVersion = "8.1.2"
+$ffName = "ffmpeg-$ffVersion-full_build-shared"
+$binDir = "bin"
+if ((Test-Path "$binDir\ffmpeg.exe") -and (Test-Path "$binDir\ffprobe.exe")) {
+    Write-Host "    already present in $binDir\" -ForegroundColor DarkGray
+} else {
+    New-Item -ItemType Directory -Force $binDir | Out-Null
+    $zip = Join-Path $env:TEMP "$ffName.zip"
+    $url = "https://github.com/GyanD/codexffmpeg/releases/download/$ffVersion/$ffName.zip"
+    if (-not (Test-Path $zip)) {
+        Write-Host "    downloading $url" -ForegroundColor DarkGray
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    }
+    $sha = (Get-FileHash $zip -Algorithm SHA256).Hash
+    Write-Host "    SHA256 $sha" -ForegroundColor DarkGray
+    Write-Host "    ^ verify against https://github.com/GyanD/codexffmpeg/releases/tag/$ffVersion" -ForegroundColor DarkGray
+    $tmp = Join-Path $env:TEMP $ffName
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    Expand-Archive -Path $zip -DestinationPath $tmp -Force
+    $srcBin = Join-Path $tmp "$ffName\bin"
+    Copy-Item (Join-Path $srcBin "ffmpeg.exe")  $binDir -Force
+    Copy-Item (Join-Path $srcBin "ffprobe.exe") $binDir -Force
+    # Bring the shared DLLs; skip ffplay and its SDL dependency to save space.
+    Get-ChildItem $srcBin -Filter *.dll | Where-Object { $_.Name -notlike "SDL2*" } |
+        ForEach-Object { Copy-Item $_.FullName $binDir -Force }
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    Write-Host "    ffmpeg + ffprobe + DLLs -> $binDir\" -ForegroundColor Green
+}
+
+Write-Host "==> Ensuring UPX (compresses the bundled ffmpeg DLLs)" -ForegroundColor Cyan
+$upxVersion = "5.2.0"
+$upxRoot = Join-Path $PSScriptRoot "tools"
+$upxDir = Join-Path $upxRoot "upx-$upxVersion-win64"
+if (-not (Test-Path (Join-Path $upxDir "upx.exe"))) {
+    try {
+        New-Item -ItemType Directory -Force $upxRoot | Out-Null
+        $zip = Join-Path $env:TEMP "upx-$upxVersion-win64.zip"
+        $url = "https://github.com/upx/upx/releases/download/v$upxVersion/upx-$upxVersion-win64.zip"
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+        Expand-Archive -Path $zip -DestinationPath $upxRoot -Force
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+        Write-Host "    upx -> $upxDir" -ForegroundColor Green
+    } catch {
+        Write-Warning "UPX fetch failed ($($_.Exception.Message)); building uncompressed (much larger exe)."
+        $upxDir = $null
+    }
+}
+$upxArgs = @()
+if ($upxDir -and (Test-Path (Join-Path $upxDir "upx.exe"))) { $upxArgs = @("--upx-dir", $upxDir) }
+
 Write-Host "==> Cleaning previous build" -ForegroundColor Cyan
 Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 
 Write-Host "==> Building with PyInstaller" -ForegroundColor Cyan
-python -m PyInstaller --noconfirm --clean TSConverter.spec
+python -m PyInstaller --noconfirm --clean @upxArgs TSConverter.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed" }
 
 $exe = "dist\TSConverter.exe"

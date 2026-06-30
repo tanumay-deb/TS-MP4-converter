@@ -27,12 +27,28 @@ except Exception:  # noqa: BLE001 - any import/lookup failure -> fall back to PA
     _IMAGEIO_FFMPEG = None
 
 
+_FFMPEG_NAMES = ("ffmpeg.exe", "ffmpeg")
+_FFPROBE_NAMES = ("ffprobe.exe", "ffprobe")
+
+
 def _frozen_base() -> Optional[Path]:
-    """Directory holding bundled binaries in a PyInstaller build, else None."""
+    """Root of the unpacked bundle in a PyInstaller build, else None."""
     if getattr(sys, "frozen", False):
         meipass = getattr(sys, "_MEIPASS", None)
         return Path(meipass) if meipass else Path(sys.executable).resolve().parent
     return None
+
+
+def _bundled_dir() -> Optional[Path]:
+    """Where the shared ffmpeg/ffprobe live inside a frozen build (bundle root)."""
+    return _frozen_base()
+
+
+def _dev_bin() -> Optional[Path]:
+    """Repo-level bin/ populated by build.ps1, for source/dev runs."""
+    if getattr(sys, "frozen", False):
+        return None
+    return Path(__file__).resolve().parents[2] / "bin"
 
 
 def _first_existing(directory: Optional[Path], names) -> Optional[str]:
@@ -45,28 +61,26 @@ def _first_existing(directory: Optional[Path], names) -> Optional[str]:
     return None
 
 
-def _resolve_ffmpeg() -> str:
-    env = os.environ.get("TSCONVERTER_FFMPEG")
+def _resolve(env_var: str, names, imageio_path: Optional[str]) -> Optional[str]:
+    env = os.environ.get(env_var)
     if env and Path(env).exists():
         return env
-    if _IMAGEIO_FFMPEG and Path(_IMAGEIO_FFMPEG).exists():
-        return _IMAGEIO_FFMPEG
-    return shutil.which("ffmpeg") or "ffmpeg"
+    for directory in (_bundled_dir(), _dev_bin()):
+        hit = _first_existing(directory, names)
+        if hit:
+            return hit
+    if imageio_path and Path(imageio_path).exists():
+        return imageio_path
+    return shutil.which(names[-1])  # plain "ffmpeg"/"ffprobe" on PATH
+
+
+def _resolve_ffmpeg() -> str:
+    return _resolve("TSCONVERTER_FFMPEG", _FFMPEG_NAMES, _IMAGEIO_FFMPEG) or "ffmpeg"
 
 
 def _resolve_ffprobe() -> Optional[str]:
-    env = os.environ.get("TSCONVERTER_FFPROBE")
-    if env and Path(env).exists():
-        return env
-    names = ("ffprobe.exe", "ffprobe")
-    bundled = _first_existing(_frozen_base(), names)
-    if bundled:
-        return bundled
-    if _IMAGEIO_FFMPEG:
-        sibling = _first_existing(Path(_IMAGEIO_FFMPEG).parent, names)
-        if sibling:
-            return sibling
-    return shutil.which("ffprobe")
+    # imageio-ffmpeg provides no ffprobe, so there is no imageio fallback here.
+    return _resolve("TSCONVERTER_FFPROBE", _FFPROBE_NAMES, None)
 
 
 FFMPEG_PATH: str = _resolve_ffmpeg()

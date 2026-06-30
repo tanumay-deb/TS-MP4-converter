@@ -57,23 +57,25 @@ On Windows you can also just double-click `run.bat`.
 
 ## Build it yourself
 
+Everything is driven by `build.ps1` (PowerShell). It fetches a pinned shared
+**ffmpeg + ffprobe** build and **UPX**, builds from `TSConverter.spec`, and runs
+`TSConverter.exe --selftest` as a smoke check before packaging.
+
 Just the `.exe`:
-
-```bash
-pip install -r requirements.txt pyinstaller
-build.bat
-```
-
-The `.exe` **and** the zero-setup installer (PowerShell; needs [Inno Setup 6](https://jrsoftware.org/isdl.php)):
 
 ```powershell
 pip install -r requirements.txt pyinstaller pillow
+.\build.ps1            # or: build.bat   (delegates to build.ps1)
+```
+
+The `.exe` **and** the zero-setup installer (needs [Inno Setup 6](https://jrsoftware.org/isdl.php)):
+
+```powershell
 .\build.ps1 -Installer
 ```
 
-Output: `dist\TSConverter.exe` (single file, ~40 MB, ffmpeg bundled inside) and
-`dist\installer\TSConverter-<version>-setup.exe`. `build.ps1` runs `TSConverter.exe --selftest`
-as a smoke check before packaging.
+Output: `dist\TSConverter.exe` (single file, ~75 MB — ffmpeg **and** ffprobe bundled
+inside) and `dist\installer\TSConverter-<version>-setup.exe`.
 
 Pushing a `vX.Y.Z` tag builds both on GitHub Actions and attaches them to the release automatically.
 
@@ -85,7 +87,14 @@ Pushing a `vX.Y.Z` tag builds both on GitHub Actions and attaches them to the re
 | **Auto** | Try copy, re-encode if it fails | Mixed | Lossless or near-lossless | Yes |
 | **Re-encode** | `-c:v h264_nvenc -c:a aac` | 5–30× realtime (GPU) | Slight loss | Yes |
 
-ffmpeg is bundled via [imageio-ffmpeg](https://pypi.org/project/imageio-ffmpeg/) — no system install required.
+The installed / portable app bundles a pinned **GPL [ffmpeg](https://ffmpeg.org/) + ffprobe**
+shared build ([gyan.dev](https://www.gyan.dev/ffmpeg/builds/) — includes libx264 / libmp3lame),
+so nothing needs to be installed. ffprobe powers structured probing (`ffprobe -print_format json`);
+if it is ever unavailable the app falls back to parsing ffmpeg output. Running from source instead
+uses [imageio-ffmpeg](https://pypi.org/project/imageio-ffmpeg/) for ffmpeg.
+
+> ffmpeg is licensed under the **GPL v3**; its corresponding source is available from the build
+> provider linked above. The rest of this project is MIT (see `LICENSE`).
 
 ## Development
 
