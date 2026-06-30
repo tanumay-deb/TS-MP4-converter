@@ -15,6 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from tsconverter import history, updater
+from tsconverter.media.handlers import REGISTRY, get_handler
 
 from converter import (
     ConflictPolicy,
@@ -60,6 +61,7 @@ class Settings:
     DEFAULTS = {
         "output_dir": SAME_AS_SOURCE,
         "mode": Mode.AUTO.value,
+        "out_format": "mp4",
         "conflict": ConflictPolicy.RENAME.value,
         "prefer_hw": True,
         "concurrency": 2,
@@ -196,11 +198,26 @@ class App:
         ttk.Label(opts, text="Mode:").pack(side="left", padx=(0, 4))
         self.mode_var = tk.StringVar(value=MODE_LABELS[Mode(self.settings.get("mode"))])
         mode_combo = ttk.Combobox(
-            opts, textvariable=self.mode_var, state="readonly", width=36,
+            opts, textvariable=self.mode_var, state="readonly", width=30,
             values=list(MODE_LABELS.values()),
         )
         mode_combo.pack(side="left", padx=2)
         mode_combo.bind("<<ComboboxSelected>>", self._on_mode_change)
+
+        ttk.Separator(opts, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        ttk.Label(opts, text="Format:").pack(side="left", padx=(0, 4))
+        cur_fmt = self.settings.get("out_format")
+        if cur_fmt not in REGISTRY:
+            cur_fmt = "mp4"
+        self._fmt_label_to_id = {h.label: fid for fid, h in REGISTRY.items()}
+        self.format_var = tk.StringVar(value=REGISTRY[cur_fmt].label)
+        fmt_combo = ttk.Combobox(
+            opts, textvariable=self.format_var, state="readonly", width=18,
+            values=[h.label for h in REGISTRY.values()],
+        )
+        fmt_combo.pack(side="left", padx=2)
+        fmt_combo.bind("<<ComboboxSelected>>", self._on_format_change)
 
         ttk.Separator(opts, orient="vertical").pack(side="left", fill="y", padx=8)
 
@@ -474,6 +491,13 @@ class App:
                 self.settings.save()
                 break
 
+    def _selected_format(self) -> str:
+        return self._fmt_label_to_id.get(self.format_var.get(), "mp4")
+
+    def _on_format_change(self, _event=None):
+        self.settings.set("out_format", self._selected_format())
+        self.settings.save()
+
     def _on_conflict_change(self):
         self.settings.set("conflict", self.conflict_var.get())
         self.settings.save()
@@ -536,12 +560,14 @@ class App:
 
         mode = self._selected_mode()
         conflict = self._selected_conflict()
+        out_format = self._selected_format()
         output_val = self.output_var.get()
         for j in self.jobs:
             if j.status in ("Done",):
                 continue
             j.mode = mode
             j.conflict = conflict
+            j.out_format = out_format
             j.out_dir = j.src.parent if output_val == SAME_AS_SOURCE else Path(output_val)
             j.status = "Queued"
             j.stage = ""

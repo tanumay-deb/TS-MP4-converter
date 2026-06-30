@@ -105,6 +105,7 @@ class Job:
     out_dir: Path
     mode: Mode = Mode.AUTO
     conflict: ConflictPolicy = ConflictPolicy.RENAME
+    out_format: str = "mp4"
 
     duration: float = 0.0
     file_size: int = 0
@@ -131,6 +132,7 @@ class Job:
         return ConversionRequest(
             src=self.src, out_dir=self.out_dir, mode=self.mode,
             conflict=self.conflict, duration=self.duration,
+            out_format=self.out_format,
         )
 
     def apply_progress(self, ev: ProgressEvent) -> None:

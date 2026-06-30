@@ -52,6 +52,21 @@ def test_convert_returns_done_result_and_writes_mp4(tmp_path, monkeypatch):
     assert any(e.stage == "Remuxing" for e in events)
 
 
+def test_convert_to_wav_is_audio_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(c, "get_logs_dir", lambda: tmp_path / "logs")
+    (tmp_path / "logs").mkdir()
+    src = tmp_path / "clip.mkv"
+    _make_clip(src)
+
+    result = c.Converter(prefer_hw=False).convert(
+        ConversionRequest(src=src, out_dir=tmp_path / "out",
+                          mode=Mode.REENCODE, out_format="wav"),
+    )
+    assert result.status == JobStatus.DONE
+    assert result.out_path and result.out_path.suffix == ".wav"
+    assert result.used_encoder == "pcm_s16le"
+
+
 def test_convert_missing_source_fails_gracefully(tmp_path, monkeypatch):
     monkeypatch.setattr(c, "get_logs_dir", lambda: tmp_path / "logs")
     (tmp_path / "logs").mkdir()
