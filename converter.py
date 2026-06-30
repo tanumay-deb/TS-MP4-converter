@@ -21,6 +21,7 @@ from tsconverter.media.ffmpeg import (  # noqa: F401  (re-exported)
     FFMPEG_PATH,
     FFPROBE_PATH,
 )
+from tsconverter.media import procctl
 from tsconverter.media.handlers import get_handler
 from tsconverter.media.probe import probe as probe_media
 from tsconverter.models import (  # noqa: F401  (re-exported for compatibility)
@@ -243,6 +244,7 @@ class _Ctx:
         self.eta_seconds = 0.0
         self.actually_used: Optional[str] = None
         self.log_lines: list = []
+        self.pause_event = None      # threading.Event; set => suspend running ffmpeg
 
 
 class Converter:
@@ -266,11 +268,17 @@ class Converter:
         request: ConversionRequest,
         on_progress: Optional[Callable[[ProgressEvent], None]] = None,
         cancel_event: Optional[threading.Event] = None,
+        pause_event: Optional[threading.Event] = None,
     ) -> ConversionResult:
-        """Run one conversion. Returns a ConversionResult; never mutates a Job."""
+        """Run one conversion. Returns a ConversionResult; never mutates a Job.
+
+        If `pause_event` is provided, a running ffmpeg is suspended while it is
+        set (best-effort, via psutil) and the stall timer is paused too.
+        """
         if cancel_event is None:
             cancel_event = threading.Event()
         ctx = _Ctx(request)
+        ctx.pause_event = pause_event
         emit = self._emitter(ctx, on_progress)
         started_at = time.time()
         ctx.log_lines = [
@@ -454,23 +462,38 @@ class Converter:
                     pass
 
         def watchdog():
-            """Kill ffmpeg promptly on cancel or stall."""
+            """Kill ffmpeg on cancel/stall; suspend it while paused."""
             last_seconds = 0.0
             last_progress_at = time.time()
+            suspended = False
+            pause_event = ctx.pause_event
             while not stop_watcher.is_set():
                 if cancel_event.is_set():
+                    if suspended:
+                        procctl.resume(proc)     # resume so the kill lands cleanly
                     kill_proc()
                     return
-                current = ctx.seconds_done
-                now = time.time()
-                if current > last_seconds + 0.05:
-                    last_seconds = current
-                    last_progress_at = now
-                elif current > 0 and (now - last_progress_at) > stall_timeout:
-                    stalled_event.set()
-                    kill_proc()
-                    return
+                paused = pause_event is not None and pause_event.is_set()
+                if paused and not suspended:
+                    suspended = procctl.suspend(proc)
+                elif not paused and suspended:
+                    procctl.resume(proc)
+                    suspended = False
+                if paused:
+                    last_progress_at = now = time.time()   # don't count stall time while paused
+                else:
+                    current = ctx.seconds_done
+                    now = time.time()
+                    if current > last_seconds + 0.05:
+                        last_seconds = current
+                        last_progress_at = now
+                    elif current > 0 and (now - last_progress_at) > stall_timeout:
+                        stalled_event.set()
+                        kill_proc()
+                        return
                 if stop_watcher.wait(0.2):
+                    if suspended:
+                        procctl.resume(proc)
                     return
 
         def stdout_reader():

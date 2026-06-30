@@ -14,7 +14,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-from tsconverter import history, updater
+from tsconverter import history, tray, updater
 from tsconverter.media import thumbnail
 from tsconverter.media.handlers import REGISTRY, get_handler
 
@@ -72,6 +72,7 @@ class Settings:
         "delete_source_warned": False,
         "check_updates": True,
         "skip_update_version": "",
+        "minimize_to_tray": False,
     }
 
     def __init__(self):
@@ -151,6 +152,9 @@ class App:
         self.worker: Optional[threading.Thread] = None
         self.converter = Converter(prefer_hw=self.settings.get("prefer_hw"))
         self.history = history.HistoryStore(get_config_dir() / "history.json")
+        self.tray: Optional[tray.Tray] = None
+        self._tray_quit = False
+        self._hidden = False
         self._drag_iid: Optional[str] = None
         self._drag_started: bool = False
 
@@ -334,7 +338,7 @@ class App:
         file_menu.add_separator()
         file_menu.add_command(label="Conversion history...", command=self.show_history)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self._on_close)
+        file_menu.add_command(label="Exit", command=self._quit_app)
         menubar.add_cascade(label="File", menu=file_menu)
         self.root.bind_all("<Control-o>", lambda e: self.add_files())
 
@@ -350,6 +354,12 @@ class App:
         edit_menu.add_checkbutton(
             label="Delete source file after successful conversion",
             variable=self.delete_after_var, command=self._on_delete_after_change,
+        )
+        self.tray_var = tk.BooleanVar(value=self.settings.get("minimize_to_tray"))
+        edit_menu.add_checkbutton(
+            label="Minimize to system tray on close",
+            variable=self.tray_var, command=self._on_tray_change,
+            state="normal" if tray.available() else "disabled",
         )
         edit_menu.add_separator()
         saved_theme = self.settings.get("theme")
@@ -643,7 +653,9 @@ class App:
 
             # The engine is pure: it returns a result, the controller maps it
             # onto the Job view-model here (the single place Job is mutated).
-            result = self.converter.convert(job.to_request(), on_progress, self.cancel_event)
+            # pause_event also suspends this job's ffmpeg if paused mid-run.
+            result = self.converter.convert(
+                job.to_request(), on_progress, self.cancel_event, self.pause_event)
             job.apply_result(result)
             if result.status in (JobStatus.DONE, JobStatus.FAILED):
                 self._record_history(job, result)
@@ -705,7 +717,7 @@ class App:
         else:
             self.pause_event.set()
             self.pause_btn.config(text="Resume")
-            self.status_label.config(text="Paused (running jobs finish; new ones held)")
+            self.status_label.config(text="Paused (running jobs suspended; new ones held)")
 
     def _finish(self, success, failed, cancelled, total):
         self.is_running = False
@@ -719,9 +731,12 @@ class App:
             parts.append(f"{failed} failed")
         if cancelled:
             parts.append(f"{cancelled} cancelled")
-        self.status_label.config(text="  •  ".join(parts))
+        summary = "  •  ".join(parts)
+        self.status_label.config(text=summary)
         self._refresh_button_state()
         self._save_queue()
+        if self._hidden and self.tray:
+            self.tray.notify(summary, "Conversions finished")
 
     def retry_failed(self):
         """Re-queue every Failed job and run them again."""
@@ -1182,14 +1197,60 @@ class App:
         else:
             self._clear_queue_file()
 
+    def _on_tray_change(self):
+        self.settings.set("minimize_to_tray", bool(self.tray_var.get()))
+        self.settings.save()
+
+    def _hide_to_tray(self):
+        if self.tray is None:
+            self.tray = tray.Tray(
+                APP_NAME,
+                on_show=lambda: self.root.after(0, self._show_from_tray),
+                on_quit=lambda: self.root.after(0, self._quit_from_tray),
+            )
+        self.tray.start()
+        self._hidden = True
+        self.root.withdraw()
+
+    def _show_from_tray(self):
+        self._hidden = False
+        self.root.deiconify()
+        self.root.lift()
+        if self.tray:
+            self.tray.stop()       # pystray icons don't reliably re-run; recreate next time
+            self.tray = None
+
+    def _quit_from_tray(self):
+        self._tray_quit = True
+        if self.tray:
+            self.tray.stop()
+            self.tray = None
+        self._hidden = False
+        self.root.deiconify()      # so any "conversion running" prompt is visible
+        self._on_close()
+
+    def _quit_app(self):
+        self._tray_quit = True
+        self._on_close()
+
     def _on_close(self):
+        # X button hides to tray when enabled (keeps converting in the background).
+        if (not self._tray_quit and self.settings.get("minimize_to_tray")
+                and tray.available()):
+            self._hide_to_tray()
+            return
         if self.is_running:
             if not messagebox.askokcancel("Quit",
                                           "A conversion is running. Cancel and quit?"):
+                self._tray_quit = False
                 return
             self.cancel_event.set()
+            self.pause_event.clear()
             if self.worker:
                 self.worker.join(timeout=3)
+        if self.tray:
+            self.tray.stop()
+            self.tray = None
         try:
             self.settings.set("geometry", self.root.geometry())
             self.settings.save()
@@ -1271,6 +1332,16 @@ def run_selftest() -> int:
         failures.append("no ffprobe bundled in the frozen build")
     else:
         emit(sys.stdout, "note: no ffprobe resolved; dev uses ffmpeg fallback\n")
+
+    # 4) optional bundled features (tray, process-suspend)
+    from tsconverter import tray
+    from tsconverter.media import procctl
+    emit(sys.stdout, f"tray={tray.available()} suspend={procctl.available()}\n")
+    if getattr(sys, "frozen", False):
+        if not procctl.available():
+            failures.append("psutil not bundled (process suspend unavailable)")
+        if not tray.available():
+            failures.append("pystray/Pillow not bundled (tray unavailable)")
 
     if failures:
         emit(sys.stderr, "SELFTEST FAILED:\n  " + "\n  ".join(failures) + "\n")

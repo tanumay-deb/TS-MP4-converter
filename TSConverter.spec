@@ -23,6 +23,10 @@ tmp_ret = collect_all('tkinterdnd2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('sv_ttk')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# pystray picks its backend (e.g. pystray._win32) by a dynamic import that
+# PyInstaller's static analysis misses — collect the whole package.
+tmp_ret = collect_all('pystray')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
@@ -35,8 +39,10 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     # The frozen app uses the bundled shared ffmpeg/ffprobe; don't also pull in
-    # imageio-ffmpeg's 83MB binary (it's only a dev/source fallback).
-    excludes=['imageio_ffmpeg'],
+    # imageio-ffmpeg's 83MB binary (it's only a dev/source fallback). numpy/scipy
+    # are dragged in by Pillow's hook but unused here (we only draw the tray icon)
+    # — excluding them avoids ~40MB of OpenBLAS.
+    excludes=['imageio_ffmpeg', 'numpy', 'scipy'],
     noarchive=False,
     optimize=0,
 )
