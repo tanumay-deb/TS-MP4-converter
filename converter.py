@@ -21,6 +21,7 @@ from tsconverter.media.ffmpeg import (  # noqa: F401  (re-exported)
     FFMPEG_PATH,
     FFPROBE_PATH,
 )
+from tsconverter.media.handlers import get_handler
 from tsconverter.media.probe import probe as probe_media
 from tsconverter.models import (  # noqa: F401  (re-exported for compatibility)
     CancelledError,
@@ -203,8 +204,9 @@ def best_h264_encoder(prefer_hw: bool = True) -> str:
     return hwaccel.best_h264_encoder(prefer_hw)
 
 
-def resolve_output_path(src: Path, out_dir: Path, policy: ConflictPolicy) -> Optional[Path]:
-    candidate = out_dir / (src.stem + ".mp4")
+def resolve_output_path(src: Path, out_dir: Path, policy: ConflictPolicy,
+                        ext: str = ".mp4") -> Optional[Path]:
+    candidate = out_dir / (src.stem + ext)
     if not candidate.exists():
         return candidate
     if policy == ConflictPolicy.OVERWRITE:
@@ -213,7 +215,7 @@ def resolve_output_path(src: Path, out_dir: Path, policy: ConflictPolicy) -> Opt
         return None
     n = 1
     while True:
-        c = out_dir / f"{src.stem} ({n}).mp4"
+        c = out_dir / f"{src.stem} ({n}){ext}"
         if not c.exists():
             return c
         n += 1
@@ -293,8 +295,11 @@ class Converter:
                     ctx.duration = d
             ctx.log_lines.append(f"Duration: {ctx.duration:.1f}s")
 
+            handler = get_handler(ctx.out_format)
+            ctx.log_lines.append(f"Format:   {handler.id} ({handler.kind})")
+
             ctx.out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = resolve_output_path(ctx.src, ctx.out_dir, ctx.conflict)
+            out_path = resolve_output_path(ctx.src, ctx.out_dir, ctx.conflict, handler.ext)
             if out_path is None:
                 raise ConversionError("Output exists; skipped")
             ctx.out_path = out_path
@@ -304,12 +309,16 @@ class Converter:
                 raise CancelledError()
 
             if ctx.mode == Mode.REMUX:
-                self._remux(ctx, emit, cancel_event)
-            elif ctx.mode == Mode.REENCODE:
-                self._reencode(ctx, emit, cancel_event)
+                # Copy-only requested; fall back to encode when copy can't work.
+                if handler.can_remux:
+                    self._remux(ctx, emit, cancel_event, handler)
+                else:
+                    self._reencode(ctx, emit, cancel_event, handler)
+            elif ctx.mode == Mode.REENCODE or not handler.can_remux:
+                self._reencode(ctx, emit, cancel_event, handler)
             else:
                 try:
-                    self._remux(ctx, emit, cancel_event)
+                    self._remux(ctx, emit, cancel_event, handler)
                 except ConversionError as e:
                     if cancel_event.is_set():
                         raise CancelledError()
@@ -322,7 +331,7 @@ class Converter:
                     ctx.log_lines.append(f"Remux failed: {e.short} — retrying with re-encode")
                     emit()
                     try:
-                        self._reencode(ctx, emit, cancel_event)
+                        self._reencode(ctx, emit, cancel_event, handler)
                     except ConversionError as e2:
                         raise ConversionError(
                             e2.short,
@@ -333,7 +342,8 @@ class Converter:
             if not cancel_event.is_set() and ctx.out_path and ctx.out_path.exists():
                 ctx.stage = "Verifying output"
                 emit()
-                ok, msg = verify_output(ctx.out_path, ctx.duration)
+                ok, msg = verify_output(ctx.out_path, ctx.duration,
+                                        expect_video=handler.expects_video())
                 verify_message = msg
                 ctx.log_lines.append(f"Verify:   {msg}")
                 if not ok:
@@ -375,14 +385,14 @@ class Converter:
             completed_at=completed_at,
         )
 
-    def _remux(self, ctx, on_update, cancel_event):
-        is_ts_family = ctx.src.suffix.lower() in (".ts", ".m2ts", ".mts")
+    def _input_cmd(self, ctx):
+        """Common input side: error-tolerant flags, junk-header skip, -i src."""
         in_opts = ts_input_opts(ctx.src)
         if in_opts:
             ctx.log_lines.append(
                 f"Junk header detected — skipping {in_opts[1]} bytes, forcing mpegts demuxer"
             )
-        cmd = [
+        return [
             FFMPEG_PATH, "-y",
             "-err_detect", "ignore_err",
             "-fflags", "+genpts+igndts+discardcorrupt",
@@ -390,61 +400,29 @@ class Converter:
             "-probesize", "100M",
             *in_opts,
             "-i", str(ctx.src),
-            "-map", "0:v?", "-map", "0:a?",
-            "-c", "copy",
         ]
-        if is_ts_family:
-            # AAC in MPEG-TS uses ADTS framing; MP4 needs ASC. Not needed for MKV.
-            cmd += ["-bsf:a", "aac_adtstoasc"]
-        cmd += [
-            "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
-            "-progress", "pipe:1",
-            "-nostats", "-loglevel", "error",
-            str(ctx.out_path),
-        ]
+
+    @staticmethod
+    def _output_tail(out_path):
+        return ["-progress", "pipe:1", "-nostats", "-loglevel", "error", str(out_path)]
+
+    def _remux(self, ctx, on_update, cancel_event, handler):
+        cmd = (self._input_cmd(ctx)
+               + handler.remux_out_args(ctx.src)
+               + self._output_tail(ctx.out_path))
         self._run(cmd, ctx, on_update, cancel_event, stage="Remuxing")
         ctx.actually_used = "remux"
 
-    def _reencode(self, ctx, on_update, cancel_event):
-        encoder = best_h264_encoder(self.prefer_hw)
-        is_hw = encoder != "libx264"
-        in_opts = ts_input_opts(ctx.src)
-        if in_opts:
-            ctx.log_lines.append(
-                f"Junk header detected — skipping {in_opts[1]} bytes, forcing mpegts demuxer"
-            )
-
-        cmd = [
-            FFMPEG_PATH, "-y",
-            "-err_detect", "ignore_err",
-            "-fflags", "+genpts+igndts+discardcorrupt",
-            "-analyzeduration", "100M",
-            "-probesize", "100M",
-            *in_opts,
-            "-i", str(ctx.src),
-            "-map", "0:v?", "-map", "0:a?",
-            "-c:v", encoder,
-        ]
-        if encoder == "libx264":
-            cmd += ["-preset", "veryfast", "-crf", "23"]
-        elif encoder == "h264_nvenc":
-            cmd += ["-preset", "p4", "-cq", "23", "-rc", "vbr"]
-        elif encoder == "h264_qsv":
-            cmd += ["-preset", "veryfast", "-global_quality", "23"]
-        elif encoder == "h264_amf":
-            cmd += ["-quality", "balanced", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23"]
-
-        cmd += [
-            "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart",
-            "-progress", "pipe:1",
-            "-nostats", "-loglevel", "error",
-            str(ctx.out_path),
-        ]
-        stage = f"Re-encoding ({'GPU: ' + encoder if is_hw else 'CPU'})"
+    def _reencode(self, ctx, on_update, cancel_event, handler):
+        out_args, used = handler.reencode_out_args(self.prefer_hw)
+        cmd = self._input_cmd(ctx) + out_args + self._output_tail(ctx.out_path)
+        if handler.kind == "video":
+            is_hw = used not in ("libx264", "libvpx-vp9")
+            stage = f"Re-encoding ({'GPU: ' + used if is_hw else 'CPU'})"
+        else:
+            stage = f"Encoding audio ({used})"
         self._run(cmd, ctx, on_update, cancel_event, stage=stage)
-        ctx.actually_used = encoder
+        ctx.actually_used = used
 
     def _run(self, cmd, ctx, on_update, cancel_event: threading.Event,
              stage: str, stall_timeout: float = 45.0):
