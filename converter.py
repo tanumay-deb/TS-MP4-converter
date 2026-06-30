@@ -9,8 +9,6 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -24,69 +22,20 @@ from tsconverter.media.ffmpeg import (  # noqa: F401  (re-exported)
     FFPROBE_PATH,
 )
 from tsconverter.media.probe import probe as probe_media
+from tsconverter.models import (  # noqa: F401  (re-exported for compatibility)
+    CancelledError,
+    ConflictPolicy,
+    ConversionError,
+    ConversionRequest,
+    ConversionResult,
+    Job,
+    JobStatus,
+    MODE_LABELS,
+    Mode,
+    ProgressEvent,
+)
 
 _CTX_PREFIX_RE = re.compile(r"^\[[^\]]+@\s*[0-9a-fx]+\]\s*", re.IGNORECASE)
-
-
-class Mode(str, Enum):
-    REMUX = "remux"
-    AUTO = "auto"
-    REENCODE = "reencode"
-
-
-MODE_LABELS = {
-    Mode.REMUX: "Fast (remux only)",
-    Mode.AUTO: "Auto (remux, re-encode if needed)",
-    Mode.REENCODE: "Re-encode (most compatible)",
-}
-
-
-class ConflictPolicy(str, Enum):
-    RENAME = "rename"
-    OVERWRITE = "overwrite"
-    SKIP = "skip"
-
-
-@dataclass
-class Job:
-    src: Path
-    out_dir: Path
-    mode: Mode = Mode.AUTO
-    conflict: ConflictPolicy = ConflictPolicy.RENAME
-
-    duration: float = 0.0
-    file_size: int = 0
-    out_path: Optional[Path] = None
-
-    status: str = "Queued"
-    stage: str = ""
-    seconds_done: float = 0.0
-    speed: float = 0.0
-    progress_pct: float = 0.0
-    eta_seconds: float = 0.0
-
-    error: Optional[str] = None
-    error_full: Optional[str] = None
-    actually_used: Optional[str] = None
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-
-    log_lines: list[str] = field(default_factory=list)
-    log_path: Optional[Path] = None
-    verify_message: Optional[str] = None
-
-
-class CancelledError(Exception):
-    pass
-
-
-class ConversionError(Exception):
-    def __init__(self, short: str, full: str = ""):
-        super().__init__(short)
-        self.short = short
-        self.full = full or short
-
-
 _SAFE_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -115,14 +64,14 @@ def get_logs_dir() -> Path:
         return fallback
 
 
-def write_job_log(job: "Job") -> Optional[Path]:
-    """Flush job.log_lines to disk. Returns the log path or None."""
-    if not job.log_lines:
+def write_log(log_lines, src_stem: str) -> Optional[Path]:
+    """Flush log lines to ./logs/<stem>_<timestamp>.log. Returns the path or None."""
+    if not log_lines:
         return None
     try:
         logs_dir = get_logs_dir()
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        safe_stem = _SAFE_NAME_RE.sub("_", job.src.stem)[:80] or "job"
+        safe_stem = _SAFE_NAME_RE.sub("_", src_stem)[:80] or "job"
         log_path = logs_dir / f"{safe_stem}_{timestamp}.log"
         # If two jobs of the same file land in the same second, disambiguate.
         n = 1
@@ -130,7 +79,7 @@ def write_job_log(job: "Job") -> Optional[Path]:
             log_path = logs_dir / f"{safe_stem}_{timestamp}_{n}.log"
             n += 1
         with open(log_path, "w", encoding="utf-8") as fp:
-            fp.write("\n".join(job.log_lines))
+            fp.write("\n".join(log_lines))
             fp.write("\n")
         return log_path
     except OSError:
@@ -270,69 +219,110 @@ def resolve_output_path(src: Path, out_dir: Path, policy: ConflictPolicy) -> Opt
         n += 1
 
 
+class _Ctx:
+    """Engine-internal mutable state for one conversion.
+
+    Replaces the old practice of mutating the UI's Job directly. It never leaves
+    the engine: progress is surfaced via ProgressEvent and the final state via
+    ConversionResult.
+    """
+    def __init__(self, req: ConversionRequest):
+        self.src = req.src
+        self.out_dir = req.out_dir
+        self.mode = req.mode
+        self.conflict = req.conflict
+        self.out_format = req.out_format
+        self.duration = req.duration
+        self.out_path: Optional[Path] = None
+        self.stage = ""
+        self.seconds_done = 0.0
+        self.speed = 0.0
+        self.progress_pct = 0.0
+        self.eta_seconds = 0.0
+        self.actually_used: Optional[str] = None
+        self.log_lines: list = []
+
+
 class Converter:
     def __init__(self, prefer_hw: bool = True):
         self.prefer_hw = prefer_hw
 
+    @staticmethod
+    def _emitter(ctx: "_Ctx", on_progress):
+        """Return a no-arg callable that snapshots ctx into a ProgressEvent."""
+        def emit():
+            if on_progress is not None:
+                on_progress(ProgressEvent(
+                    stage=ctx.stage, seconds_done=ctx.seconds_done,
+                    speed=ctx.speed, progress_pct=ctx.progress_pct,
+                    eta_seconds=ctx.eta_seconds, duration=ctx.duration,
+                ))
+        return emit
+
     def convert(
         self,
-        job: Job,
-        on_update: Callable[[], None],
-        cancel_event: threading.Event,
-    ):
-        job.started_at = time.time()
-        job.log_lines = [
+        request: ConversionRequest,
+        on_progress: Optional[Callable[[ProgressEvent], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> ConversionResult:
+        """Run one conversion. Returns a ConversionResult; never mutates a Job."""
+        if cancel_event is None:
+            cancel_event = threading.Event()
+        ctx = _Ctx(request)
+        emit = self._emitter(ctx, on_progress)
+        started_at = time.time()
+        ctx.log_lines = [
             f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} ===",
-            f"Source:   {job.src}",
-            f"Mode:     {job.mode.value}",
-            f"Conflict: {job.conflict.value}",
+            f"Source:   {ctx.src}",
+            f"Mode:     {ctx.mode.value}",
+            f"Conflict: {ctx.conflict.value}",
         ]
+        status = JobStatus.DONE
+        error_short = error_full = verify_message = None
         verify_ok = True
 
         try:
             if cancel_event.is_set():
                 raise CancelledError()
 
-            if not job.duration:
-                job.stage = "Probing"
-                on_update()
-                d = probe_duration(job.src)
+            if not ctx.duration:
+                ctx.stage = "Probing"
+                emit()
+                d = probe_duration(ctx.src)
                 if d:
-                    job.duration = d
+                    ctx.duration = d
+            ctx.log_lines.append(f"Duration: {ctx.duration:.1f}s")
 
-            job.log_lines.append(f"Duration: {job.duration:.1f}s")
-
-            job.out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = resolve_output_path(job.src, job.out_dir, job.conflict)
+            ctx.out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = resolve_output_path(ctx.src, ctx.out_dir, ctx.conflict)
             if out_path is None:
                 raise ConversionError("Output exists; skipped")
-            job.out_path = out_path
-            job.log_lines.append(f"Output:   {out_path}")
+            ctx.out_path = out_path
+            ctx.log_lines.append(f"Output:   {out_path}")
 
             if cancel_event.is_set():
                 raise CancelledError()
 
-            if job.mode == Mode.REMUX:
-                self._remux(job, on_update, cancel_event)
-            elif job.mode == Mode.REENCODE:
-                self._reencode(job, on_update, cancel_event)
+            if ctx.mode == Mode.REMUX:
+                self._remux(ctx, emit, cancel_event)
+            elif ctx.mode == Mode.REENCODE:
+                self._reencode(ctx, emit, cancel_event)
             else:
                 try:
-                    self._remux(job, on_update, cancel_event)
+                    self._remux(ctx, emit, cancel_event)
                 except ConversionError as e:
                     if cancel_event.is_set():
                         raise CancelledError()
-                    if job.out_path and job.out_path.exists():
+                    if ctx.out_path and ctx.out_path.exists():
                         try:
-                            job.out_path.unlink()
+                            ctx.out_path.unlink()
                         except OSError:
                             pass
-                    job.stage = "Re-encoding (remux failed, retrying)"
-                    job.error = None
-                    job.log_lines.append(f"Remux failed: {e.short} — retrying with re-encode")
-                    on_update()
+                    ctx.stage = "Re-encoding (remux failed, retrying)"
+                    ctx.log_lines.append(f"Remux failed: {e.short} — retrying with re-encode")
+                    emit()
                     try:
-                        self._reencode(job, on_update, cancel_event)
+                        self._reencode(ctx, emit, cancel_event)
                     except ConversionError as e2:
                         raise ConversionError(
                             e2.short,
@@ -340,39 +330,56 @@ class Converter:
                         )
 
             # Output verification (quick probe — sub-second on most files)
-            if not cancel_event.is_set() and job.out_path and job.out_path.exists():
-                job.stage = "Verifying output"
-                on_update()
-                ok, msg = verify_output(job.out_path, job.duration)
-                job.verify_message = msg
-                job.log_lines.append(f"Verify:   {msg}")
+            if not cancel_event.is_set() and ctx.out_path and ctx.out_path.exists():
+                ctx.stage = "Verifying output"
+                emit()
+                ok, msg = verify_output(ctx.out_path, ctx.duration)
+                verify_message = msg
+                ctx.log_lines.append(f"Verify:   {msg}")
                 if not ok:
                     verify_ok = False
                     raise ConversionError(
                         f"Verify failed: {msg}",
                         f"Output file failed post-conversion verification.\n{msg}\n\n"
-                        f"The output file was kept at:\n{job.out_path}",
+                        f"The output file was kept at:\n{ctx.out_path}",
                     )
-
-            job.completed_at = time.time()
-            job.log_lines.append(
-                f"Done in {job.completed_at - job.started_at:.1f}s"
-            )
         except CancelledError:
-            job.log_lines.append("CANCELLED")
-            raise
+            status = JobStatus.CANCELLED
+            ctx.log_lines.append("CANCELLED")
         except ConversionError as e:
+            status = JobStatus.FAILED
+            error_short, error_full = e.short, e.full
             if verify_ok:
-                job.log_lines.append(f"FAILED: {e.short}")
-            raise
-        finally:
-            job.log_path = write_job_log(job)
+                ctx.log_lines.append(f"FAILED: {e.short}")
+        except Exception as e:  # noqa: BLE001 - report unexpected errors as a result
+            status = JobStatus.FAILED
+            error_short = error_full = f"{type(e).__name__}: {e}"
+            ctx.log_lines.append(f"FAILED: {error_short}")
 
-    def _remux(self, job, on_update, cancel_event):
-        is_ts_family = job.src.suffix.lower() in (".ts", ".m2ts", ".mts")
-        in_opts = ts_input_opts(job.src)
+        completed_at = time.time()
+        if status == JobStatus.DONE:
+            ctx.log_lines.append(f"Done in {completed_at - started_at:.1f}s")
+        log_path = write_log(ctx.log_lines, ctx.src.stem)
+
+        return ConversionResult(
+            status=status,
+            out_path=ctx.out_path,
+            duration=ctx.duration,
+            used_encoder=ctx.actually_used,
+            verify_message=verify_message,
+            error=error_short,
+            error_full=error_full,
+            log_lines=ctx.log_lines,
+            log_path=log_path,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+
+    def _remux(self, ctx, on_update, cancel_event):
+        is_ts_family = ctx.src.suffix.lower() in (".ts", ".m2ts", ".mts")
+        in_opts = ts_input_opts(ctx.src)
         if in_opts:
-            job.log_lines.append(
+            ctx.log_lines.append(
                 f"Junk header detected — skipping {in_opts[1]} bytes, forcing mpegts demuxer"
             )
         cmd = [
@@ -382,7 +389,7 @@ class Converter:
             "-analyzeduration", "100M",
             "-probesize", "100M",
             *in_opts,
-            "-i", str(job.src),
+            "-i", str(ctx.src),
             "-map", "0:v?", "-map", "0:a?",
             "-c", "copy",
         ]
@@ -394,17 +401,17 @@ class Converter:
             "-movflags", "+faststart",
             "-progress", "pipe:1",
             "-nostats", "-loglevel", "error",
-            str(job.out_path),
+            str(ctx.out_path),
         ]
-        self._run(cmd, job, on_update, cancel_event, stage="Remuxing")
-        job.actually_used = "remux"
+        self._run(cmd, ctx, on_update, cancel_event, stage="Remuxing")
+        ctx.actually_used = "remux"
 
-    def _reencode(self, job, on_update, cancel_event):
+    def _reencode(self, ctx, on_update, cancel_event):
         encoder = best_h264_encoder(self.prefer_hw)
         is_hw = encoder != "libx264"
-        in_opts = ts_input_opts(job.src)
+        in_opts = ts_input_opts(ctx.src)
         if in_opts:
-            job.log_lines.append(
+            ctx.log_lines.append(
                 f"Junk header detected — skipping {in_opts[1]} bytes, forcing mpegts demuxer"
             )
 
@@ -415,7 +422,7 @@ class Converter:
             "-analyzeduration", "100M",
             "-probesize", "100M",
             *in_opts,
-            "-i", str(job.src),
+            "-i", str(ctx.src),
             "-map", "0:v?", "-map", "0:a?",
             "-c:v", encoder,
         ]
@@ -433,21 +440,21 @@ class Converter:
             "-movflags", "+faststart",
             "-progress", "pipe:1",
             "-nostats", "-loglevel", "error",
-            str(job.out_path),
+            str(ctx.out_path),
         ]
         stage = f"Re-encoding ({'GPU: ' + encoder if is_hw else 'CPU'})"
-        self._run(cmd, job, on_update, cancel_event, stage=stage)
-        job.actually_used = encoder
+        self._run(cmd, ctx, on_update, cancel_event, stage=stage)
+        ctx.actually_used = encoder
 
-    def _run(self, cmd, job: Job, on_update, cancel_event: threading.Event,
+    def _run(self, cmd, ctx, on_update, cancel_event: threading.Event,
              stage: str, stall_timeout: float = 45.0):
-        job.stage = stage
-        job.seconds_done = 0.0
-        job.speed = 0.0
+        ctx.stage = stage
+        ctx.seconds_done = 0.0
+        ctx.speed = 0.0
         on_update()
 
-        job.log_lines.append(f"--- {stage} ---")
-        job.log_lines.append("Command: " + " ".join(
+        ctx.log_lines.append(f"--- {stage} ---")
+        ctx.log_lines.append("Command: " + " ".join(
             f'"{c}"' if " " in str(c) else str(c) for c in cmd
         ))
 
@@ -476,7 +483,7 @@ class Converter:
                 if cancel_event.is_set():
                     kill_proc()
                     return
-                current = job.seconds_done
+                current = ctx.seconds_done
                 now = time.time()
                 if current > last_seconds + 0.05:
                     last_seconds = current
@@ -526,19 +533,19 @@ class Converter:
                 if line.startswith("out_time_ms="):
                     try:
                         micros = int(line.split("=", 1)[1])
-                        job.seconds_done = max(0.0, micros / 1_000_000.0)
-                        if job.duration > 0:
-                            job.progress_pct = min(100.0, job.seconds_done / job.duration * 100)
-                            if job.speed > 0:
-                                remaining = max(0.0, job.duration - job.seconds_done)
-                                job.eta_seconds = remaining / job.speed
+                        ctx.seconds_done = max(0.0, micros / 1_000_000.0)
+                        if ctx.duration > 0:
+                            ctx.progress_pct = min(100.0, ctx.seconds_done / ctx.duration * 100)
+                            if ctx.speed > 0:
+                                remaining = max(0.0, ctx.duration - ctx.seconds_done)
+                                ctx.eta_seconds = remaining / ctx.speed
                         on_update()
                     except ValueError:
                         pass
                 elif line.startswith("speed="):
                     val = line.split("=", 1)[1].strip().rstrip("x")
                     try:
-                        job.speed = float(val)
+                        ctx.speed = float(val)
                     except ValueError:
                         pass
                 elif line == "progress=end":
@@ -559,19 +566,19 @@ class Converter:
             out_t.join(timeout=1)
             err_t.join(timeout=1)
 
-        job.log_lines.append(f"Exit code: {proc.returncode}")
+        ctx.log_lines.append(f"Exit code: {proc.returncode}")
         if stderr_buf:
-            job.log_lines.append("--- ffmpeg stderr ---")
+            ctx.log_lines.append("--- ffmpeg stderr ---")
             for raw in stderr_buf:
                 stripped = raw.rstrip()
                 if stripped:
-                    job.log_lines.append(stripped)
+                    ctx.log_lines.append(stripped)
 
         if cancel_event.is_set():
             raise CancelledError()
         if stalled_event.is_set():
             raise ConversionError(
-                f"Stalled at {job.progress_pct:.0f}% (no progress for {int(stall_timeout)}s)",
+                f"Stalled at {ctx.progress_pct:.0f}% (no progress for {int(stall_timeout)}s)",
                 f"ffmpeg produced no new output for {int(stall_timeout)} seconds. "
                 f"This usually means a corrupt section the remuxer can't skip. "
                 f"Re-encode mode will handle it."

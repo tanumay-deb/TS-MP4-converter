@@ -14,10 +14,9 @@ from typing import Optional
 
 from converter import (
     ConflictPolicy,
-    ConversionError,
     Converter,
-    CancelledError,
     Job,
+    JobStatus,
     MODE_LABELS,
     Mode,
     detect_hw_encoders,
@@ -561,7 +560,7 @@ class App:
 
         def worker(job: Job):
             if self.cancel_event.is_set():
-                job.status = "Cancelled"
+                job.status = JobStatus.CANCELLED.value
                 self._refresh_row(job)
                 with lock:
                     counts["cancel"] += 1
@@ -572,12 +571,16 @@ class App:
             job.status = "Running"
             self._refresh_row(job)
 
-            try:
-                self.converter.convert(
-                    job, lambda j=job: self._refresh_row(j), self.cancel_event,
-                )
-                job.status = "Done"
-                job.progress_pct = 100
+            def on_progress(ev, j=job):
+                j.apply_progress(ev)
+                self._refresh_row(j)
+
+            # The engine is pure: it returns a result, the controller maps it
+            # onto the Job view-model here (the single place Job is mutated).
+            result = self.converter.convert(job.to_request(), on_progress, self.cancel_event)
+            job.apply_result(result)
+
+            if result.status == JobStatus.DONE:
                 with lock:
                     counts["done"] += 1
                 if (self.settings.get("delete_source_after_success")
@@ -588,8 +591,7 @@ class App:
                         job.stage = "Source deleted"
                     except OSError:
                         pass
-            except CancelledError:
-                job.status = "Cancelled"
+            elif result.status == JobStatus.CANCELLED:
                 with lock:
                     counts["cancel"] += 1
                 if job.out_path and job.out_path.exists():
@@ -597,16 +599,7 @@ class App:
                         job.out_path.unlink()
                     except OSError:
                         pass
-            except ConversionError as e:
-                job.status = "Failed"
-                job.error = e.short
-                job.error_full = e.full
-                with lock:
-                    counts["fail"] += 1
-            except Exception as e:
-                job.status = "Failed"
-                job.error = f"{type(e).__name__}: {e}"
-                job.error_full = job.error
+            else:  # FAILED / SKIPPED
                 with lock:
                     counts["fail"] += 1
 
