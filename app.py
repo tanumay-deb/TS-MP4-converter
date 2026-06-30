@@ -145,6 +145,9 @@ class App:
         self.settings = Settings()
         self.jobs: list[Job] = []
         self.job_by_iid: dict[str, Job] = {}
+        self._dirty_rows: set[str] = set()      # iids needing a redraw
+        self._dirty_lock = threading.Lock()
+        self._flush_scheduled = False
         self.is_running = False
         self.converter = Converter(prefer_hw=self.settings.get("prefer_hw"))
         self.history = history.HistoryStore(get_config_dir() / "history.json")
@@ -817,24 +820,32 @@ class App:
             eta_text,
         )
 
+    _STATUS_TAGS = {"Done": "done", "Failed": "failed",
+                    "Cancelled": "cancelled", "Running": "running"}
+
     def _refresh_row(self, job: Job):
-        def do():
-            for iid, j in self.job_by_iid.items():
-                if j is job:
-                    if not self.tree.exists(iid):
-                        return
-                    tag = ""
-                    if job.status == "Done":
-                        tag = "done"
-                    elif job.status == "Failed":
-                        tag = "failed"
-                    elif job.status == "Cancelled":
-                        tag = "cancelled"
-                    elif job.status == "Running":
-                        tag = "running"
-                    self.tree.item(iid, values=self._row_values(job), tags=(tag,) if tag else ())
-                    return
-        self.root.after(0, do)
+        # Called from worker threads on every ffmpeg progress tick. Mark the row
+        # dirty and coalesce redraws into one periodic flush so the UI thread
+        # isn't flooded (which made window resize janky during conversion).
+        iid = str(id(job))
+        with self._dirty_lock:
+            self._dirty_rows.add(iid)
+            if self._flush_scheduled:
+                return
+            self._flush_scheduled = True
+        self.root.after(80, self._flush_rows)
+
+    def _flush_rows(self):
+        with self._dirty_lock:
+            dirty = self._dirty_rows
+            self._dirty_rows = set()
+            self._flush_scheduled = False
+        for iid in dirty:
+            job = self.job_by_iid.get(iid)
+            if job is None or not self.tree.exists(iid):
+                continue
+            tag = self._STATUS_TAGS.get(job.status, "")
+            self.tree.item(iid, values=self._row_values(job), tags=(tag,) if tag else ())
 
     def _set_overall(self, pct):
         self.root.after(0, lambda: self.overall_progress.config(value=pct))
