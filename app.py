@@ -42,7 +42,7 @@ except ImportError:
     _HAS_SVTTK = False
 
 APP_NAME = "TS to MP4 Converter"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 SAME_AS_SOURCE = "(same folder as source)"
 
 
