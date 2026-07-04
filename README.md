@@ -19,7 +19,7 @@ A desktop app to batch-convert video files to MP4 (or MKV / MOV / WebM, or extra
 - **Conversion analytics** — success rate, output size, media processed, and format/encoder breakdown (File → **Conversion analytics…**)
 - **Thumbnail preview** — right-click a file → **Preview**; or File → **Thumbnail gallery…** for a grid of all queued files
 - **System tray** (opt-in) — close to tray, conversions keep running, with a completion notification
-- **Automatic update check** against GitHub Releases (Help → **Check for updates**)
+- **Automatic updates** — checks GitHub Releases (Help → **Check for updates**); installed Windows builds can **download and install** the update in place (downloads the signed-host setup.exe over HTTPS, runs it, relaunches). Portable/dev just open the download page.
 - **Crash-safe queue** — unfinished jobs restored on the next launch
 - **Output verification** — every conversion is probed (via ffprobe) to flag silently-broken outputs
 - **Per-file logs** saved to a `logs/` folder next to the app (right-click → **Open log**)

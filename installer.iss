@@ -31,6 +31,10 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
+; For in-app self-update: close a running instance (Restart Manager) so files
+; can be replaced; we relaunch the app ourselves.
+CloseApplications=yes
+RestartApplications=no
 SetupIconFile=assets\icon.ico
 
 [Languages]

@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -694,6 +695,15 @@ class App:
             return
         if (not manual) and info.version == self.settings.get("skip_update_version"):
             return
+
+        # Installed Windows builds can download + run the installer directly;
+        # dev / portable / other platforms just open the download page.
+        can_self_update = (getattr(sys, "frozen", False) and os.name == "nt"
+                           and bool(info.setup_url))
+        if can_self_update:
+            self._offer_self_update(info)
+            return
+
         choice = messagebox.askyesnocancel(
             "Update available",
             f"{APP_NAME} {info.tag} is available — you have v{APP_VERSION}.\n\n"
@@ -706,6 +716,80 @@ class App:
         elif choice is None:            # Cancel = skip this version
             self.settings.set("skip_update_version", info.version)
             self.settings.save()
+
+    def _offer_self_update(self, info):
+        win = tk.Toplevel(self.root)
+        win.title("Update available")
+        win.geometry("470x230")
+        frame = ttk.Frame(win, padding=14)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame, justify="left",
+            text=f"{APP_NAME} {info.tag} is available.\nYou have v{APP_VERSION}.",
+        ).pack(anchor="w")
+        size_txt = f"  ({fmt_size(info.setup_size)})" if info.setup_size else ""
+        status = ttk.Label(frame, foreground="#666",
+                           text=f"Installer: {info.setup_name}{size_txt}")
+        status.pack(anchor="w", pady=(6, 0))
+        bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
+
+        btns = ttk.Frame(frame)
+        btns.pack(side="bottom", fill="x", pady=(12, 0))
+
+        def set_buttons(state):
+            for w in btns.winfo_children():
+                w.config(state=state)
+
+        def do_skip():
+            self.settings.set("skip_update_version", info.version)
+            self.settings.save()
+            win.destroy()
+
+        def finish_dl(ok, dest):
+            if not win.winfo_exists():
+                return
+            if not ok:
+                status.config(text="Download failed. Try the download page instead.")
+                set_buttons("normal")
+                return
+            if info.setup_size and dest.stat().st_size != info.setup_size:
+                status.config(text="Downloaded file looks wrong (size mismatch).")
+                set_buttons("normal")
+                return
+            status.config(text="Starting installer — the app will close and reopen…")
+            self.root.after(400, lambda: self._run_installer_and_quit(dest))
+
+        def do_download():
+            set_buttons("disabled")
+            bar.pack(fill="x", pady=(10, 0))
+            status.config(text="Downloading…")
+            dest = Path(tempfile.gettempdir()) / (info.setup_name or "TSConverter-setup.exe")
+
+            def on_progress(read, total):
+                self.root.after(0, lambda: bar.config(value=read / total * 100))
+
+            def work():
+                ok = updater.download(info.setup_url, str(dest), on_progress=on_progress)
+                self.root.after(0, lambda: finish_dl(ok, dest))
+            threading.Thread(target=work, daemon=True).start()
+
+        ttk.Button(btns, text="Download & install", command=do_download).pack(side="left")
+        ttk.Button(btns, text="Skip this version", command=do_skip).pack(side="right")
+        ttk.Button(btns, text="Later", command=win.destroy).pack(side="right", padx=6)
+
+    def _run_installer_and_quit(self, setup_path):
+        # Wait for this app to close, run the installer silently, then relaunch.
+        app_exe = sys.executable
+        cmd = (f'timeout /t 2 /nobreak >nul & "{setup_path}" /SILENT '
+               f'/SUPPRESSMSGBOXES /CLOSEAPPLICATIONS && start "" "{app_exe}"')
+        try:
+            subprocess.Popen(["cmd", "/c", cmd], creationflags=0x08000000)  # CREATE_NO_WINDOW
+        except OSError:
+            webbrowser.open(setup_path if isinstance(setup_path, str) else str(setup_path))
+            return
+        self._tray_quit = True
+        self._on_close()
 
     def _record_history(self, job: Job, result):
         out = str(job.out_path) if job.out_path else ""
