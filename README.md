@@ -16,7 +16,8 @@ A desktop app to batch-convert video files to MP4 (or MKV / MOV / WebM, or extra
 - **Retry failed** — one button re-runs every failed job
 - **Cancel any time**, partial outputs cleaned up
 - **Conversion history** — persistent log of past conversions (File → **Conversion history…**)
-- **Thumbnail preview** — right-click a file → **Preview**
+- **Conversion analytics** — success rate, output size, media processed, and format/encoder breakdown (File → **Conversion analytics…**)
+- **Thumbnail preview** — right-click a file → **Preview**; or File → **Thumbnail gallery…** for a grid of all queued files
 - **System tray** (opt-in) — close to tray, conversions keep running, with a completion notification
 - **Automatic update check** against GitHub Releases (Help → **Check for updates**)
 - **Crash-safe queue** — unfinished jobs restored on the next launch

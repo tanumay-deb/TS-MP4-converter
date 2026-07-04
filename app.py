@@ -9,6 +9,7 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
+from collections import Counter
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
@@ -345,6 +346,8 @@ class App:
         file_menu.add_command(label="Clear list", command=self.clear_files)
         file_menu.add_separator()
         file_menu.add_command(label="Conversion history...", command=self.show_history)
+        file_menu.add_command(label="Conversion analytics...", command=self.show_analytics)
+        file_menu.add_command(label="Thumbnail gallery...", command=self.show_gallery)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._quit_app)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -794,6 +797,90 @@ class App:
                 rows.clear()
         ttk.Button(btns, text="Clear history", command=do_clear).pack(side="left")
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+
+    def show_analytics(self):
+        entries = self.history.all()
+        if not entries:
+            messagebox.showinfo("Conversion analytics", "No conversions recorded yet.")
+            return
+        done = [e for e in entries if e.result == "Done"]
+        failed = [e for e in entries if e.result == "Failed"]
+        total = len(entries)
+        total_out = sum(e.size for e in done)
+        total_dur = sum(e.duration for e in done)
+        by_fmt = Counter(
+            (Path(e.out).suffix.lstrip(".").lower() or "?") for e in done if e.out)
+        by_enc = Counter((e.encoder or "?") for e in done)
+
+        lines = [
+            f"Total conversions : {total}",
+            f"  Succeeded       : {len(done)}",
+            f"  Failed          : {len(failed)}",
+            f"  Success rate    : {len(done) / total * 100:.0f}%",
+            "",
+            f"Output produced   : {fmt_size(total_out)}",
+            f"Media processed   : {fmt_duration(total_dur)}",
+        ]
+        peak = max(by_fmt.values(), default=0)
+        if by_fmt:
+            lines += ["", "By output format:"]
+            for fmt, n in by_fmt.most_common():
+                bar = "█" * max(1, round(n / peak * 20)) if peak else ""
+                lines.append(f"  {fmt:6} {n:4}  {bar}")
+        if by_enc:
+            lines += ["", "By encoder / method:"]
+            for enc, n in by_enc.most_common():
+                lines.append(f"  {enc:16} {n}")
+        self._show_text_dialog("Conversion analytics", "\n".join(lines), mono=True)
+
+    def show_gallery(self):
+        if not self.jobs:
+            messagebox.showinfo("Thumbnail gallery", "Add some files to the list first.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Thumbnail gallery")
+        win.geometry("740x540")
+        win._thumb_refs = []
+
+        canvas = tk.Canvas(win, borderwidth=0, highlightthickness=0)
+        vsb = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas, padding=8)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        cols = 3
+        cells = []
+        for i, job in enumerate(list(self.jobs)):
+            cell = ttk.Frame(inner, padding=6)
+            cell.grid(row=i // cols, column=i % cols, sticky="n")
+            img_lbl = ttk.Label(cell, text="…", width=26, anchor="center")
+            img_lbl.pack()
+            ttk.Label(cell, text=job.src.name, wraplength=200, anchor="center",
+                      justify="center").pack(pady=(4, 0))
+            cells.append((job, img_lbl))
+
+        def load():
+            for job, lbl in cells:
+                png = thumbnail.extract_thumbnail(job.src, width=200)
+
+                def place(p=png, l=lbl):
+                    if not win.winfo_exists():
+                        return
+                    if not p:
+                        l.config(text="(no preview)")
+                        return
+                    try:
+                        img = tk.PhotoImage(file=str(p))
+                        win._thumb_refs.append(img)
+                        l.config(image=img, text="")
+                    except Exception:
+                        l.config(text="(no preview)")
+                self.root.after(0, place)
+        threading.Thread(target=load, daemon=True).start()
 
     def _row_values(self, job: Job):
         if job.progress_pct >= 1 or job.status in ("Done", "Running"):
