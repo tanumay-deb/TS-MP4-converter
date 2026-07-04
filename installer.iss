@@ -1,12 +1,12 @@
 ; Inno Setup script for TS to MP4 Converter.
-; Build with: iscc installer.iss   (after PyInstaller has produced dist\TSConverter.exe)
-; The app is a PyInstaller --onefile build, so the installer bundles a single exe
-; (ffmpeg is already baked into it — nothing else to install).
+; Build with: iscc installer.iss   (after PyInstaller has produced dist\TSConverter\)
+; The app is a PyInstaller onedir build, so the installer bundles the whole app
+; folder (TSConverter.exe + _internal\ with ffmpeg/ffprobe — nothing else to install).
 
 #define AppName "TS to MP4 Converter"
 ; Overridable from the command line: iscc /DAppVersion=1.4.0 installer.iss
 #ifndef AppVersion
-  #define AppVersion "1.7.0"
+  #define AppVersion "1.7.1"
 #endif
 #define AppPublisher "Tanumay Goswami"
 #define AppExe "TSConverter.exe"

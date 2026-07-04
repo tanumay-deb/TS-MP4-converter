@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ts-mp4-converter"
-version = "1.7.0"
+version = "1.7.1"
 description = "Desktop app to batch-convert video to MP4/MKV/MOV/WebM or extract audio to MP3/M4A/WAV/FLAC/Opus, with GPU acceleration and bundled ffmpeg."
 readme = "README.md"
 license = { text = "MIT" }
