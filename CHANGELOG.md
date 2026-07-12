@@ -3,6 +3,9 @@
 All notable changes to this project. Releases are also published (with installers)
 on the [Releases](https://github.com/tanumay-deb/TS-MP4-converter/releases) page.
 
+## v1.7.2
+- Add this **CHANGELOG**. No functional changes since v1.7.1.
+
 ## v1.7.1
 - In-app **self-update** for installed Windows builds: download and run the release
   installer in place (HTTPS, own-host only), then relaunch.
