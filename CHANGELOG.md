@@ -3,7 +3,7 @@
 All notable changes to this project. Releases are also published (with installers)
 on the [Releases](https://github.com/tanumay-deb/TS-MP4-converter/releases) page.
 
-## Unreleased
+## v1.7.3
 - **What's new** screen: release notes pop up once on the first launch of each new
   version (Help → What's new to reread).
 - **Show thumbnails** switch: a frame beside every file in the list (remembered).
