@@ -3,6 +3,15 @@
 All notable changes to this project. Releases are also published (with installers)
 on the [Releases](https://github.com/tanumay-deb/TS-MP4-converter/releases) page.
 
+## Unreleased
+- **What's new** screen: release notes pop up once on the first launch of each new
+  version (Help → What's new to reread).
+- **Show thumbnails** switch: a frame beside every file in the list (remembered).
+- File-list **column widths** are adjustable and remembered.
+- Much faster installed app: the build no longer UPX-packs ffmpeg (each ffmpeg/ffprobe
+  launch was ~3 s slower). The thumbnail gallery now loads 4 files at a time.
+- Fix: no thumbnail for junk-header `.ts` files, or for short `.ts` clips with few keyframes.
+
 ## v1.7.2
 - Add this **CHANGELOG**. No functional changes since v1.7.1.
 

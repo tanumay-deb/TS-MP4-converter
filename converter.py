@@ -23,7 +23,7 @@ from tsconverter.media.ffmpeg import (  # noqa: F401  (re-exported)
 )
 from tsconverter.media import procctl
 from tsconverter.media.handlers import get_handler
-from tsconverter.media.probe import probe as probe_media
+from tsconverter.media.probe import detect_ts_offset, probe as probe_media
 from tsconverter.models import (  # noqa: F401  (re-exported for compatibility)
     CancelledError,
     ConflictPolicy,
@@ -142,37 +142,6 @@ def extract_error(stderr: str) -> str:
         if any(k in low for k in keywords) and not low.startswith("conversion failed"):
             return ln
     return lines[-1]
-
-
-TS_SYNC = 0x47          # MPEG-TS packet sync byte
-TS_PACKET = 188         # standard transport stream packet size
-
-
-def detect_ts_offset(src: Path, scan_bytes: int = 65536, max_prefix: int = 4096) -> int:
-    """Return the byte offset where a junk-prefixed MPEG-TS stream really starts.
-
-    Some 'fake' .ts files have junk bytes (often a tiny PNG) prepended so that
-    ffmpeg sniffs the wrong format (e.g. png_pipe, a 1x1 image) and never finds
-    the video. The real transport stream begins at the first 0x47 sync byte that
-    recurs at the 188-byte packet stride. Returns 0 for clean files (the stream
-    already starts at byte 0) or if no transport stream is found.
-    """
-    try:
-        with open(src, "rb") as fp:
-            buf = fp.read(scan_bytes)
-    except OSError:
-        return 0
-    n = len(buf)
-    need = TS_PACKET * 2
-    if n < need + 1:
-        return 0
-    upper = min(max_prefix, n - need)
-    for off in range(upper + 1):
-        if (buf[off] == TS_SYNC
-                and buf[off + TS_PACKET] == TS_SYNC
-                and buf[off + 2 * TS_PACKET] == TS_SYNC):
-            return off
-    return 0
 
 
 def ts_input_opts(src: Path) -> list[str]:

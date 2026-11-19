@@ -17,9 +17,11 @@ A desktop app to batch-convert video files to MP4 (or MKV / MOV / WebM, or extra
 - **Cancel any time**, partial outputs cleaned up
 - **Conversion history** — persistent log of past conversions (File → **Conversion history…**)
 - **Conversion analytics** — success rate, output size, media processed, and format/encoder breakdown (File → **Conversion analytics…**)
-- **Thumbnail preview** — right-click a file → **Preview**; or File → **Thumbnail gallery…** for a grid of all queued files
+- **Thumbnail preview** — switch on **Show thumbnails** for a frame beside every file in the list; right-click a file → **Preview**; or File → **Thumbnail gallery…** for a grid of all queued files
+- **Adjustable columns** — drag the column borders in the file list; widths are remembered
 - **System tray** (opt-in) — close to tray, conversions keep running, with a completion notification
 - **Automatic updates** — checks GitHub Releases (Help → **Check for updates**); installed Windows builds can **download and install** the update in place (downloads the signed-host setup.exe over HTTPS, runs it, relaunches). Portable/dev just open the download page.
+- **What's new** — after each update, the new version's release notes pop up once (Help → **What's new** to reread)
 - **Crash-safe queue** — unfinished jobs restored on the next launch
 - **Output verification** — every conversion is probed (via ffprobe) to flag silently-broken outputs
 - **Per-file logs** saved to a `logs/` folder next to the app (right-click → **Open log**)
@@ -66,7 +68,7 @@ On Windows you can also just double-click `run.bat`.
 ## Build it yourself
 
 Everything is driven by `build.ps1` (PowerShell). It fetches a pinned shared
-**ffmpeg + ffprobe** build and **UPX**, builds from `TSConverter.spec`, and runs
+**ffmpeg + ffprobe** build, builds from `TSConverter.spec`, and runs
 `TSConverter.exe --selftest` as a smoke check before packaging.
 
 Just the app folder:
@@ -146,8 +148,8 @@ tests/                       # pytest suite
 
 ### Packaging / CI
 
-- `TSConverter.spec` — PyInstaller build spec (onedir; bundles ffmpeg+ffprobe, UPX-compressed)
-- `build.ps1` — fetches ffmpeg/ffprobe + UPX, builds, runs `--selftest`; `-Installer` (Inno Setup), `-Sign`
+- `TSConverter.spec` — PyInstaller build spec (onedir; bundles ffmpeg+ffprobe, no UPX — packed DLLs made every ffmpeg launch ~3s slower)
+- `build.ps1` — fetches ffmpeg/ffprobe, builds, runs `--selftest`; `-Installer` (Inno Setup), `-Sign`
 - `build.bat` — delegates to `build.ps1`
 - `installer.iss` — Inno Setup script for the zero-setup installer
 - `.github/workflows/ci.yml` — runs the test suite on every push/PR

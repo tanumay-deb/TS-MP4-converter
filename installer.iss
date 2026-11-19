@@ -11,6 +11,12 @@
 #define AppPublisher "Tanumay Goswami"
 #define AppExe "TSConverter.exe"
 #define AppUrl "https://github.com/tanumay-deb/TS-MP4-converter"
+; Uninstall survey: the feedback form's pre-filled link with the reason answer set to
+; "Uninstalling" and the version answer last, its value cut off (AppVersion is appended).
+; Same form as tsconverter/feedback.py. Empty = no survey.
+#ifndef FeedbackUrl
+  #define FeedbackUrl ""
+#endif
 
 [Setup]
 AppId={{C7E4F1A8-2B9D-4A36-9F71-6D5C0E3B82A4}
@@ -54,3 +60,16 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// After a normal (not silent) uninstall, open the feedback form with "Uninstalling"
+// preselected. Through explorer.exe so the browser runs as the user, not with the
+// uninstaller's admin rights (ShellExecAsOriginalUser is not available at uninstall).
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+begin
+  if (CurUninstallStep = usPostUninstall) and not UninstallSilent and ('{#FeedbackUrl}' <> '') then
+    Exec(ExpandConstant('{win}\explorer.exe'), '"{#FeedbackUrl}{#AppVersion}"', '',
+         SW_SHOWNORMAL, ewNoWait, ResultCode);
+end;

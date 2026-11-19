@@ -40,6 +40,20 @@ def is_newer(latest: str, current: str) -> bool:
     return a > b
 
 
+def release_notes(version: str, changelog: str) -> str:
+    """Plain-text notes for `version` from CHANGELOG.md text ("## v1.2.3" sections)."""
+    out, inside = [], False
+    for line in changelog.splitlines():
+        if line.startswith("## "):
+            if inside:
+                break
+            words = line[3:].split()
+            inside = bool(words) and words[0].lstrip("v") == version
+        elif inside:
+            out.append(line.replace("**", "").replace("`", ""))
+    return "\n".join(out).strip()
+
+
 def check_for_update(current_version: str, timeout: float = 8.0) -> Optional[UpdateInfo]:
     """Return UpdateInfo when the latest release is newer than current, else None.
 

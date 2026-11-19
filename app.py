@@ -1,6 +1,7 @@
 """TS to MP4 Converter — desktop app."""
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -12,10 +13,10 @@ import tkinter as tk
 import webbrowser
 from collections import Counter
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 from typing import Optional
 
-from tsconverter import history, tray, updater
+from tsconverter import feedback, history, tray, updater
 from tsconverter.media import thumbnail
 from tsconverter.media.handlers import REGISTRY, get_handler
 from tsconverter.queue import QueueController
@@ -74,6 +75,9 @@ class Settings:
         "check_updates": True,
         "skip_update_version": "",
         "minimize_to_tray": False,
+        "col_widths": {},
+        "show_thumbs": False,
+        "last_seen_version": "",
     }
 
     def __init__(self):
@@ -148,6 +152,7 @@ class App:
         self.jobs: list[Job] = []
         self.job_by_iid: dict[str, Job] = {}
         self._dirty_rows: set[str] = set()      # iids needing a redraw
+        self._row_thumbs: dict[str, tk.PhotoImage] = {}   # iid -> image (keeps refs alive)
         self._dirty_lock = threading.Lock()
         self._flush_scheduled = False
         self.is_running = False
@@ -172,6 +177,8 @@ class App:
         self._build_ui()
         self._enable_dnd()
         self._refresh_button_state()
+        # Before the restore-queue prompt (200ms) so that modal lands on top, not under it.
+        self.root.after(100, lambda: self.show_whats_new(auto=True))
         self.root.after(200, self._load_queue_if_exists)
         if self.settings.get("check_updates"):
             self.root.after(1500, lambda: self._check_updates_async(manual=False))
@@ -205,6 +212,12 @@ class App:
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(toolbar, text="Inspect", command=self.inspect_selected).pack(side="left", padx=2)
         ttk.Button(toolbar, text="Show in folder", command=self.show_in_folder).pack(side="left", padx=2)
+        self.show_thumbs_var = tk.BooleanVar(value=bool(self.settings.get("show_thumbs")))
+        ttk.Checkbutton(
+            toolbar, text="Show thumbnails", variable=self.show_thumbs_var,
+            command=self._on_thumbs_toggle,
+            style="Switch.TCheckbutton" if _HAS_SVTTK else "TCheckbutton",
+        ).pack(side="right", padx=2)
 
         # Options strip
         opts = ttk.Frame(self.root, padding=(10, 4))
@@ -273,18 +286,25 @@ class App:
 
         cols = ("file", "size", "duration", "status", "progress", "speed", "eta")
         self.tree = ttk.Treeview(list_wrap, columns=cols, show="headings", selectmode="extended")
+        # (key, label, default width, min width, stretch, anchor). Only File/Status
+        # stretch, so window resizes and border drags don't reshuffle numeric columns.
         headings = [
-            ("file", "File", 280, "w"),
-            ("size", "Size", 80, "e"),
-            ("duration", "Length", 80, "e"),
-            ("status", "Status", 200, "w"),
-            ("progress", "Progress", 80, "e"),
-            ("speed", "Speed", 70, "e"),
-            ("eta", "ETA", 70, "e"),
+            ("file", "File", 260, 140, True, "w"),
+            ("size", "Size", 80, 50, False, "e"),
+            ("duration", "Length", 80, 50, False, "e"),
+            ("status", "Status", 200, 120, True, "w"),
+            ("progress", "Progress", 80, 50, False, "e"),
+            ("speed", "Speed", 70, 50, False, "e"),
+            ("eta", "ETA", 70, 50, False, "e"),
         ]
-        for key, label, width, anchor in headings:
+        saved = self.settings.get("col_widths")
+        saved = saved if isinstance(saved, dict) else {}
+        for key, label, width, minw, stretch, anchor in headings:
+            w = saved.get(key)
+            if not isinstance(w, int) or w < minw:   # settings.json is hand-editable
+                w = width
             self.tree.heading(key, text=label)
-            self.tree.column(key, width=width, anchor=anchor)
+            self.tree.column(key, width=w, minwidth=minw, stretch=stretch, anchor=anchor)
         self.tree.tag_configure("failed", foreground="#b00020")
         self.tree.tag_configure("done", foreground="#0a7d29")
         self.tree.tag_configure("cancelled", foreground="#996600")
@@ -300,6 +320,7 @@ class App:
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+        self._apply_thumbs_mode()
 
         # Drop hint overlay
         if _HAS_DND:
@@ -327,6 +348,13 @@ class App:
 
         self.start_btn = ttk.Button(bot_row, text="Start", command=self.start, style="Accent.TButton")
         self.start_btn.pack(side="right", padx=2)
+
+        if feedback.FORM_URL:
+            self._link_font = tkfont.nametofont("TkDefaultFont").copy()   # ref: Tk drops it on GC
+            self._link_font.configure(underline=True)
+            link = ttk.Label(bot_row, text="Send feedback", cursor="hand2", font=self._link_font)
+            link.pack(side="right", padx=(0, 14))
+            link.bind("<Button-1>", lambda e: self.send_feedback())
 
         # Right-click context menu
         self.ctx_menu = tk.Menu(self.root, tearoff=0)
@@ -398,6 +426,9 @@ class App:
             variable=self.check_updates_var, command=self._on_check_updates_change,
         )
         help_menu.add_separator()
+        help_menu.add_command(label="What's new", command=self.show_whats_new)
+        if feedback.FORM_URL:
+            help_menu.add_command(label="Send feedback...", command=self.send_feedback)
         help_menu.add_command(label="About", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
 
@@ -455,6 +486,7 @@ class App:
     def _add_paths(self, paths):
         existing = {str(j.src) for j in self.jobs}
         added = 0
+        new_jobs = []
         for p in paths:
             p = os.path.abspath(p)
             if p in existing:
@@ -471,9 +503,13 @@ class App:
             self.tree.insert("", "end", iid=iid, values=self._row_values(job))
             existing.add(p)
             added += 1
+            new_jobs.append(job)
         if added:
             self._refresh_button_state()
             self._save_queue()
+            if self.show_thumbs_var.get():
+                self._load_thumbs_async(new_jobs, self._THUMB_W, self._set_row_thumb,
+                                        height=self._THUMB_H)
 
     def remove_selected(self):
         if self.is_running:
@@ -482,6 +518,7 @@ class App:
             job = self.job_by_iid.pop(iid, None)
             if job:
                 self.jobs.remove(job)
+            self._row_thumbs.pop(iid, None)   # iid = id(job); a reused id must not inherit it
             self.tree.delete(iid)
         self._refresh_button_state()
         self._save_queue()
@@ -492,6 +529,7 @@ class App:
         self.tree.delete(*self.tree.get_children())
         self.jobs.clear()
         self.job_by_iid.clear()
+        self._row_thumbs.clear()
         self._refresh_button_state()
         self._clear_queue_file()
 
@@ -549,6 +587,7 @@ class App:
                 sv_ttk.set_theme(theme)
             except Exception:
                 pass
+        self._apply_thumbs_mode()   # ttk style config is per-theme; re-apply row height
 
     def _on_delete_after_change(self):
         v = self.delete_after_var.get()
@@ -917,6 +956,62 @@ class App:
                 lines.append(f"  {enc:16} {n}")
         self._show_text_dialog("Conversion analytics", "\n".join(lines), mono=True)
 
+    _THUMB_W, _THUMB_H = 80, 45     # list-row thumbnail box (16:9)
+
+    def _load_thumbs_async(self, jobs, width, on_ready, height=None):
+        """Extract thumbnails 4 at a time; on_ready(job, png_or_None) runs on the UI thread."""
+        jobs = list(jobs)
+        if not jobs:
+            return
+
+        def work():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                futs = {pool.submit(thumbnail.extract_thumbnail, j.src, width, height=height): j
+                        for j in jobs}
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        png = fut.result()
+                    except Exception:
+                        png = None
+                    self.root.after(0, on_ready, futs[fut], png)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_thumbs_toggle(self):
+        self.settings.set("show_thumbs", bool(self.show_thumbs_var.get()))
+        self.settings.save()
+        self._apply_thumbs_mode()
+
+    def _apply_thumbs_mode(self):
+        if not self.show_thumbs_var.get():
+            self.tree.configure(style="Treeview", show="headings")
+            return
+        style = ttk.Style()
+        style.configure("Thumbs.Treeview", rowheight=self._THUMB_H + 8)
+
+        # Rows never have children: drop the expand-arrow slot, which otherwise pushes
+        # the image ~20px right, past the #0 column into the File text.
+        def strip(layout):
+            return [(n, dict(o, children=strip(o["children"])) if "children" in o else o)
+                    for n, o in layout if not n.endswith(".indicator")]
+        style.layout("Thumbs.Treeview.Item", strip(style.layout("Treeview.Item")))
+        self.tree.configure(style="Thumbs.Treeview", show="tree headings")
+        self.tree.column("#0", width=self._THUMB_W + 12, minwidth=self._THUMB_W + 12,
+                         stretch=False)
+        missing = [j for j in self.jobs if str(id(j)) not in self._row_thumbs]
+        self._load_thumbs_async(missing, self._THUMB_W, self._set_row_thumb,
+                                height=self._THUMB_H)
+
+    def _set_row_thumb(self, job, png):
+        iid = str(id(job))
+        if not png or self.job_by_iid.get(iid) is not job or not self.tree.exists(iid):
+            return
+        try:
+            img = tk.PhotoImage(file=str(png))
+        except tk.TclError:
+            return
+        self._row_thumbs[iid] = img
+        self.tree.item(iid, image=img)
+
     def show_gallery(self):
         if not self.jobs:
             messagebox.showinfo("Thumbnail gallery", "Add some files to the list first.")
@@ -937,34 +1032,31 @@ class App:
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
         cols = 3
-        cells = []
-        for i, job in enumerate(list(self.jobs)):
+        jobs = list(self.jobs)
+        labels = {}
+        for i, job in enumerate(jobs):
             cell = ttk.Frame(inner, padding=6)
             cell.grid(row=i // cols, column=i % cols, sticky="n")
             img_lbl = ttk.Label(cell, text="…", width=26, anchor="center")
             img_lbl.pack()
             ttk.Label(cell, text=job.src.name, wraplength=200, anchor="center",
                       justify="center").pack(pady=(4, 0))
-            cells.append((job, img_lbl))
+            labels[id(job)] = img_lbl
 
-        def load():
-            for job, lbl in cells:
-                png = thumbnail.extract_thumbnail(job.src, width=200)
-
-                def place(p=png, l=lbl):
-                    if not win.winfo_exists():
-                        return
-                    if not p:
-                        l.config(text="(no preview)")
-                        return
-                    try:
-                        img = tk.PhotoImage(file=str(p))
-                        win._thumb_refs.append(img)
-                        l.config(image=img, text="")
-                    except Exception:
-                        l.config(text="(no preview)")
-                self.root.after(0, place)
-        threading.Thread(target=load, daemon=True).start()
+        def place(job, png):
+            lbl = labels.get(id(job))
+            if lbl is None or not win.winfo_exists():
+                return
+            if not png:
+                lbl.config(text="(no preview)")
+                return
+            try:
+                img = tk.PhotoImage(file=str(png))
+                win._thumb_refs.append(img)
+                lbl.config(image=img, text="")
+            except Exception:
+                lbl.config(text="(no preview)")
+        self._load_thumbs_async(jobs, 200, place, height=113)   # 16:9 box: even grid rows
 
     def _row_values(self, job: Job):
         if job.progress_pct >= 1 or job.status in ("Done", "Running"):
@@ -1207,7 +1299,7 @@ class App:
         win.geometry("760x460")
         frame = ttk.Frame(win, padding=10)
         frame.pack(fill="both", expand=True)
-        font = ("Consolas", 9) if mono else None
+        font = ("Consolas", 9) if mono else "TkTextFont"   # tk.Text defaults to Courier
         widget = tk.Text(frame, wrap="word", font=font)
         widget.insert("1.0", text)
         widget.config(state="disabled")
@@ -1216,6 +1308,29 @@ class App:
         widget.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+
+    def show_whats_new(self, auto=False):
+        """Help > What's new. auto=True: only on the first launch of a new version."""
+        if auto:
+            if self.settings.get("last_seen_version") == APP_VERSION:
+                return
+            self.settings.set("last_seen_version", APP_VERSION)
+            self.settings.save()
+        # Frozen builds bundle CHANGELOG.md at the bundle root (see TSConverter.spec).
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        try:
+            notes = updater.release_notes(APP_VERSION,
+                                          (base / "CHANGELOG.md").read_text(encoding="utf-8"))
+        except OSError:
+            notes = ""
+        if notes or not auto:
+            self._show_text_dialog(
+                f"What's new in version {APP_VERSION}",
+                notes or "No release notes are bundled with this build.\n\nSee "
+                         "https://github.com/tanumay-deb/TS-MP4-converter/releases")
+
+    def send_feedback(self):
+        webbrowser.open(feedback.form_url(APP_VERSION))
 
     def _show_about(self):
         hw = detect_hw_encoders()
@@ -1341,6 +1456,8 @@ class App:
             self.tray = None
         try:
             self.settings.set("geometry", self.root.geometry())
+            self.settings.set("col_widths", {c: self.tree.column(c, "width")
+                                             for c in self.tree["columns"]})
             self.settings.save()
             self._save_queue()
         except Exception:

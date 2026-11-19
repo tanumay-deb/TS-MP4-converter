@@ -66,32 +66,11 @@ if ((Test-Path "$binDir\ffmpeg.exe") -and (Test-Path "$binDir\ffprobe.exe")) {
     Write-Host "    ffmpeg + ffprobe + DLLs -> $binDir\" -ForegroundColor Green
 }
 
-Write-Host "==> Ensuring UPX (compresses the bundled ffmpeg DLLs)" -ForegroundColor Cyan
-$upxVersion = "5.2.0"
-$upxRoot = Join-Path $PSScriptRoot "tools"
-$upxDir = Join-Path $upxRoot "upx-$upxVersion-win64"
-if (-not (Test-Path (Join-Path $upxDir "upx.exe"))) {
-    try {
-        New-Item -ItemType Directory -Force $upxRoot | Out-Null
-        $zip = Join-Path $env:TEMP "upx-$upxVersion-win64.zip"
-        $url = "https://github.com/upx/upx/releases/download/v$upxVersion/upx-$upxVersion-win64.zip"
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-        Expand-Archive -Path $zip -DestinationPath $upxRoot -Force
-        Remove-Item $zip -Force -ErrorAction SilentlyContinue
-        Write-Host "    upx -> $upxDir" -ForegroundColor Green
-    } catch {
-        Write-Warning "UPX fetch failed ($($_.Exception.Message)); building uncompressed (much larger exe)."
-        $upxDir = $null
-    }
-}
-$upxArgs = @()
-if ($upxDir -and (Test-Path (Join-Path $upxDir "upx.exe"))) { $upxArgs = @("--upx-dir", $upxDir) }
-
 Write-Host "==> Cleaning previous build" -ForegroundColor Cyan
 Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 
 Write-Host "==> Building with PyInstaller" -ForegroundColor Cyan
-python -m PyInstaller --noconfirm --clean @upxArgs TSConverter.spec
+python -m PyInstaller --noconfirm --clean TSConverter.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed" }
 
 $exe = "dist\TSConverter\TSConverter.exe"   # onedir layout

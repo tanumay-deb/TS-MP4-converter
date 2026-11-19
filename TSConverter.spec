@@ -11,6 +11,8 @@ binaries = []
 hiddenimports = []
 if os.path.exists(_ICON):
     datas += [(_ICON, 'assets')]
+# Help > What's new (and the post-update popup) reads this version's section.
+datas += [(os.path.join(SPECPATH, 'CHANGELOG.md'), '.')]
 # Bundle the shared ffmpeg + ffprobe executables (build.ps1 fetches them) as
 # binaries, at the bundle root. PyInstaller analyses each exe and pulls in its
 # av*.dll dependencies once — adding the DLLs ourselves would duplicate them.
@@ -59,8 +61,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -75,7 +76,8 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
-    upx_exclude=[],
+    # No UPX: packed ffmpeg DLLs cost ~3s of decompression on EVERY ffmpeg/ffprobe
+    # launch (vs 0.04s unpacked). The installer's LZMA2 already compresses downloads.
+    upx=False,
     name='TSConverter',
 )

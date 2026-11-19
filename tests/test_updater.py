@@ -13,6 +13,26 @@ def test_is_newer_handles_two_and_three_part_versions():
     assert not u.is_newer("garbage", "1.4.0")
 
 
+def test_release_notes_extracts_one_version_as_plain_text():
+    md = ("# Changelog\n\n## Unreleased\n- wip\n\n"
+          "## v1.2.0 (2026-01-01)\n- **Bold** `code`\n- two\n\n## v1.1.0\n- old\n")
+    assert u.release_notes("1.2.0", md) == "- Bold code\n- two"
+    assert u.release_notes("1.1.0", md) == "- old"
+    assert u.release_notes("1.2", md) == ""
+    assert u.release_notes("9.9.9", md) == ""
+
+
+def test_changelog_has_notes_for_current_version():
+    # The app pops these up on the first launch of each version: never ship without them.
+    import re
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    app_src = (root / "app.py").read_text(encoding="utf-8")
+    version = re.search(r'^APP_VERSION = "(.+)"', app_src, re.M).group(1)
+    assert u.release_notes(version, (root / "CHANGELOG.md").read_text(encoding="utf-8")), \
+        f"CHANGELOG.md has no '## v{version}' section"
+
+
 class _Resp:
     def __init__(self, payload):
         self._payload = payload
