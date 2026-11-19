@@ -18,6 +18,10 @@ permissions:
 jobs:
   windows-installer:
     runs-on: windows-latest
+    env:
+      # Optional: a classic GitHub PAT (public_repo scope) lets each tagged release
+      # update the winget package (TSConverter.TSConverter). Skipped without it.
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,3 +70,15 @@ jobs:
           files: |
             dist/installer/*.exe
             dist/TSConverter-*-portable.zip
+
+      - name: Submit the new version to winget
+        if: github.event_name == 'push' && env.WINGET_TOKEN != ''
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $base = "https://github.com/${{ github.repository }}/releases"
+          .\wingetcreate.exe update TSConverter.TSConverter --version ${{ steps.ver.outputs.version }} `
+            --urls "$base/download/$tag/TSConverter-${{ steps.ver.outputs.version }}-setup.exe" `
+            --release-notes-url "$base/tag/$tag" --release-date (Get-Date -Format yyyy-MM-dd) `
+            --submit --token $env:WINGET_TOKEN
