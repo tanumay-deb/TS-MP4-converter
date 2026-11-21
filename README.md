@@ -39,6 +39,12 @@ A desktop app to batch-convert video files to MP4 (or MKV / MOV / WebM, or extra
 2. Run it. It installs to your machine, adds a Start Menu (and optional desktop) shortcut, and registers an uninstaller.
 3. Launch from the Start Menu. **No Python and no ffmpeg install needed** — everything is bundled.
 
+Or install the same thing from a terminal with [winget](https://learn.microsoft.com/windows/package-manager/winget/):
+
+```powershell
+winget install tsconverter
+```
+
 Prefer not to install? Grab the `-portable.zip` from the same page, unzip it anywhere, and run `TSConverter.exe` from the folder.
 
 ### Option 2 — Install with pipx (one-liner)
