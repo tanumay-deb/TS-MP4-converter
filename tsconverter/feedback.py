@@ -7,7 +7,9 @@ import urllib.parse
 # The form's "Get pre-filled link", with the sample answers replaced by {version}
 # and {os}. Empty hides every feedback entry point. installer.iss has its own
 # copy (FeedbackUrl) for the uninstall survey.
-FORM_URL = ""
+FORM_URL = ("https://docs.google.com/forms/d/e/"
+            "1FAIpQLSfWqDBaixb86yIZpCTIWi7qgdc51QH50MmLIRZjrljdROA5mQ/viewform"
+            "?usp=pp_url&entry.645232226={version}&entry.841044536={os}")
 
 
 def form_url(app_version: str) -> str:

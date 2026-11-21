@@ -18,10 +18,6 @@ permissions:
 jobs:
   windows-installer:
     runs-on: windows-latest
-    env:
-      # Optional: a classic GitHub PAT (public_repo scope) lets each tagged release
-      # update the winget package (TSConverter.TSConverter). Skipped without it.
-      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,6 +44,10 @@ jobs:
           $tag = "${{ github.event.inputs.tag }}"
           if (-not $tag) { $tag = "${{ github.ref_name }}" }
           $ver = $tag.TrimStart('v')
+          # A tag the app doesn't know it is would make the updater offer this release forever.
+          if (-not (Select-String -Path app.py -SimpleMatch "APP_VERSION = `"$ver`"" -Quiet)) {
+            throw "app.py APP_VERSION does not match tag $tag"
+          }
           "tag=$tag"     | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
           "version=$ver" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
@@ -72,9 +72,16 @@ jobs:
             dist/TSConverter-*-portable.zip
 
       - name: Submit the new version to winget
-        if: github.event_name == 'push' && env.WINGET_TOKEN != ''
+        if: github.event_name == 'push'
+        continue-on-error: true   # best-effort: the release itself is already published
+        env:
+          # Optional: a classic GitHub PAT (public_repo scope) that updates the winget
+          # package (TSConverter.TSConverter). Set on this step only, so no other step
+          # (or third-party action) can read it.
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
         shell: pwsh
         run: |
+          if (-not $env:WINGET_TOKEN) { Write-Host "WINGET_TOKEN not set; skipping winget."; exit 0 }
           Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
           $tag = "${{ steps.ver.outputs.tag }}"
           $base = "https://github.com/${{ github.repository }}/releases"

@@ -3,14 +3,46 @@
 All notable changes to this project. Releases are also published (with installers)
 on the [Releases](https://github.com/tanumay-deb/TS-MP4-converter/releases) page.
 
+## v1.7.4
+- Tell us what you think: click **Send feedback** at the bottom of the window, or go to
+  Help → Send feedback. It takes under a minute and is anonymous.
+- If you uninstall the app, your browser opens a short form asking why, so we can
+  make it better.
+- Drag a folder onto the window to add all the videos in it.
+- Fixed: two videos with the same name (for example, from different folders) no longer
+  overwrite each other.
+- Fixed for TV recordings: Fast (remux only) mode works, 5.1 surround sound converts
+  to WebM and Opus, and M4A output always has AAC sound, so it plays everywhere.
+- When a conversion fails, the message now says why, instead of a generic ffmpeg line.
+- Fixed: re-encoded videos now play on phones, TVs and in browsers, even when the
+  original is a 10-bit (4K or HDR) recording.
+- Fixed: when the drive runs out of space, the app now says so and removes the
+  half-written file. Before, it could quietly re-encode the video at lower quality to
+  make it fit, even replacing an existing file. If files converting at the same time
+  filled the drive, they are retried one at a time, so as many as possible fit.
+- "If exists: Overwrite" now keeps your old file until the new one is finished and
+  checked. With "Skip", files that already exist show as Skipped, not Failed.
+- Fixed: NVIDIA and AMD graphics cards are now detected and used for re-encoding (the
+  app used the CPU before). If the card can't encode a video, the CPU finishes it.
+- An update no longer starts while a conversion is running, and the app opens again
+  if you say No to the Windows permission prompt during an update. The portable
+  version opens the download page instead of installing a second copy.
+- The window no longer opens off-screen after you unplug a monitor, and it opens
+  maximized if you closed it maximized.
+- The buttons and status at the bottom of the window no longer disappear when
+  thumbnails are on.
+- Installing with pipx works again, and on Mac and Linux you can now open converted
+  files from the app.
+
 ## v1.7.3
-- **What's new** screen: release notes pop up once on the first launch of each new
-  version (Help → What's new to reread).
-- **Show thumbnails** switch: a frame beside every file in the list (remembered).
-- File-list **column widths** are adjustable and remembered.
-- Much faster installed app: the build no longer UPX-packs ffmpeg (each ffmpeg/ffprobe
-  launch was ~3 s slower). The thumbnail gallery now loads 4 files at a time.
-- Fix: no thumbnail for junk-header `.ts` files, or for short `.ts` clips with few keyframes.
+- See a small picture of each video in the list: turn on **Show thumbnails** at the
+  top right.
+- Drag the edges of the column headers to resize the columns. The app remembers your
+  widths.
+- Faster: previews, the thumbnail gallery and conversions start with much less waiting.
+- Previews now work for more .ts files, including some that showed no picture before.
+- This **What's new** window appears once after each update. Open it again any time from
+  Help → What's new.
 
 ## v1.7.2
 - Add this **CHANGELOG**. No functional changes since v1.7.1.

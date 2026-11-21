@@ -11,12 +11,21 @@ from typing import List, Tuple
 from .hwaccel import best_h264_encoder
 
 _TS_FAMILY = (".ts", ".m2ts", ".mts")
+# Copies AAC audio only: this filter rejects every other codec (AC-3, MP2 in TV
+# recordings), so Auto falls back to a re-encode that plays everywhere. Fast (remux
+# only) skips it and copies whatever is there; ffmpeg converts ADTS AAC by itself.
+_AAC_ONLY = ["-bsf:a", "aac_adtstoasc"]
+# libopus takes only the standard (Vorbis) layouts and rejects e.g. AC-3 "5.1(side)",
+# the usual audio of TV recordings. This lets ffmpeg convert to one it takes.
+_OPUS_LAYOUTS = ["-af", "aformat=channel_layouts=7.1|5.1|stereo|mono"]
 
 
 def _h264_video_args(prefer_hw: bool) -> Tuple[List[str], str]:
     """``-c:v <encoder>`` plus quality params; returns (args, encoder_name)."""
     encoder = best_h264_encoder(prefer_hw)
-    args = ["-c:v", encoder]
+    # 8-bit 4:2:0: a 10-bit source otherwise gives H.264 "High 10", which browsers,
+    # phones and TVs can't play (and NVENC refuses to encode).
+    args = ["-c:v", encoder, "-pix_fmt", "yuv420p"]
     if encoder == "libx264":
         args += ["-preset", "veryfast", "-crf", "23"]
     elif encoder == "h264_nvenc":
@@ -38,8 +47,9 @@ class FormatHandler:
     def expects_video(self) -> bool:
         return self.kind == "video"
 
-    def remux_out_args(self, src) -> List[str]:
-        """Output-side args for a stream-copy. `src` allows source-aware filters."""
+    def remux_out_args(self, src, aac_only: bool = True) -> List[str]:
+        """Output-side args for a stream-copy. `src` allows source-aware filters;
+        aac_only (Auto mode) refuses to copy audio that isn't AAC, see _AAC_ONLY."""
         raise NotImplementedError
 
     def reencode_out_args(self, prefer_hw: bool) -> Tuple[List[str], str]:
@@ -54,11 +64,10 @@ class _Mp4LikeHandler(FormatHandler):
     kind = "video"
     _faststart = True
 
-    def remux_out_args(self, src) -> List[str]:
+    def remux_out_args(self, src, aac_only: bool = True) -> List[str]:
         args = ["-map", "0:v?", "-map", "0:a?", "-c", "copy"]
-        if str(src).lower().endswith(_TS_FAMILY):
-            # AAC in MPEG-TS uses ADTS framing; MP4/MOV need ASC.
-            args += ["-bsf:a", "aac_adtstoasc"]
+        if aac_only and str(src).lower().endswith(_TS_FAMILY):
+            args += _AAC_ONLY      # TS only: other sources have always copied their audio
         args += ["-avoid_negative_ts", "make_zero"]
         if self._faststart:
             args += ["-movflags", "+faststart"]
@@ -83,7 +92,7 @@ class MovHandler(_Mp4LikeHandler):
 class MkvHandler(FormatHandler):
     id, ext, label, kind = "mkv", ".mkv", "MKV (H.264/AAC)", "video"
 
-    def remux_out_args(self, src) -> List[str]:
+    def remux_out_args(self, src, aac_only: bool = True) -> List[str]:
         return ["-map", "0:v?", "-map", "0:a?", "-c", "copy"]
 
     def reencode_out_args(self, prefer_hw: bool) -> Tuple[List[str], str]:
@@ -95,13 +104,10 @@ class WebmHandler(FormatHandler):
     # WebM can't hold H.264/AAC, so a copy is never valid — always re-encode.
     id, ext, label, kind, can_remux = "webm", ".webm", "WebM (VP9/Opus)", "video", False
 
-    def remux_out_args(self, src) -> List[str]:
-        return ["-map", "0:v?", "-map", "0:a?", "-c", "copy"]  # unused
-
     def reencode_out_args(self, prefer_hw: bool) -> Tuple[List[str], str]:
         return (["-map", "0:v?", "-map", "0:a?",
                  "-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0",
-                 "-c:a", "libopus", "-b:a", "128k"], "libvpx-vp9")
+                 *_OPUS_LAYOUTS, "-c:a", "libopus", "-b:a", "128k"], "libvpx-vp9")
 
 
 # --- audio targets (drop the video stream) ------------------------------------
@@ -112,8 +118,10 @@ class _AudioHandler(FormatHandler):
     _aargs: List[str] = []
     _faststart = False
 
-    def remux_out_args(self, src) -> List[str]:
+    def remux_out_args(self, src, aac_only: bool = True) -> List[str]:
         args = ["-vn", "-map", "0:a?", "-c:a", "copy"]
+        if aac_only:               # only M4A remuxes, and "M4A / AAC" must hold AAC
+            args += _AAC_ONLY
         if self._faststart:
             args += ["-movflags", "+faststart"]
         return args
@@ -148,7 +156,7 @@ class FlacHandler(_AudioHandler):
 
 class OpusHandler(_AudioHandler):
     id, ext, label, can_remux = "opus", ".opus", "Opus (audio)", False
-    _acodec, _aargs = "libopus", ["-b:a", "160k"]
+    _acodec, _aargs = "libopus", ["-b:a", "160k", *_OPUS_LAYOUTS]
 
 
 # Ordered: video containers first, then audio targets.

@@ -9,7 +9,7 @@ A desktop app to batch-convert video files to MP4 (or MKV / MOV / WebM, or extra
 - **Three modes**: Fast remux (instant), Auto (remux + re-encode fallback), or full Re-encode
 - **GPU acceleration** auto-detected: NVENC / Quick Sync / AMF
 - **Parallel conversion** (1–8 simultaneous jobs)
-- **Drag-and-drop** files into the window; **drag-to-reorder** the queue
+- **Drag-and-drop** files or whole folders into the window; **drag-to-reorder** the queue
 - **Handles broken sources** — auto-falls-back to re-encode when remux stalls
 - **Handles fake/junk-prefixed `.ts`** — files with a bogus header (e.g. a 1×1 PNG glued in front of the real stream) are auto-detected and converted anyway
 - **Pause / Resume** — suspends running jobs (and holds queued ones) without cancelling
@@ -22,6 +22,7 @@ A desktop app to batch-convert video files to MP4 (or MKV / MOV / WebM, or extra
 - **System tray** (opt-in) — close to tray, conversions keep running, with a completion notification
 - **Automatic updates** — checks GitHub Releases (Help → **Check for updates**); installed Windows builds can **download and install** the update in place (downloads the signed-host setup.exe over HTTPS, runs it, relaunches). Portable/dev just open the download page.
 - **What's new** — after each update, the new version's release notes pop up once (Help → **What's new** to reread)
+- **Send feedback** — status-bar link or Help → **Send feedback…** opens a short anonymous form (app and Windows version filled in); uninstalling opens it too, asking why
 - **Crash-safe queue** — unfinished jobs restored on the next launch
 - **Output verification** — every conversion is probed (via ffprobe) to flag silently-broken outputs
 - **Per-file logs** saved to a `logs/` folder next to the app (right-click → **Open log**)

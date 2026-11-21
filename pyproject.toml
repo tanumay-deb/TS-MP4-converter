@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ts-mp4-converter"
-version = "1.7.3"
+version = "1.7.4"
 description = "Desktop app to batch-convert video to MP4/MKV/MOV/WebM or extract audio to MP3/M4A/WAV/FLAC/Opus, with GPU acceleration and bundled ffmpeg."
 readme = "README.md"
 license = { text = "MIT" }
@@ -41,3 +41,5 @@ Issues = "https://github.com/tanumay-deb/TS-MP4-converter/issues"
 
 [tool.setuptools]
 py-modules = ["app", "converter"]
+# Listing py-modules turns off package auto-discovery, so packages must be listed too.
+packages = ["tsconverter", "tsconverter.media"]

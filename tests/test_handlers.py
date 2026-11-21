@@ -12,12 +12,14 @@ def test_ext_matches_id():
         assert h.ext == "." + fid
 
 
-def test_mp4_remux_adds_adtstoasc_only_for_ts_sources():
+def test_mp4_auto_copies_only_aac_audio_from_ts_sources():
     h = H.get_handler("mp4")
     ts_args = h.remux_out_args("clip.ts")
     assert "-c" in ts_args and "copy" in ts_args
     assert "aac_adtstoasc" in ts_args and "+faststart" in ts_args
     assert "aac_adtstoasc" not in h.remux_out_args("clip.mkv")
+    # Fast (remux only) copies any audio: the AAC-only filter failed it on AC-3/MP2.
+    assert "aac_adtstoasc" not in h.remux_out_args("clip.ts", aac_only=False)
 
 
 def test_mkv_remux_has_no_faststart():
@@ -30,6 +32,8 @@ def test_video_reencode_uses_selected_h264_encoder(monkeypatch):
     args, used = H.get_handler("mp4").reencode_out_args(prefer_hw=False)
     assert used == "libx264"
     assert "-c:v" in args and "libx264" in args and "aac" in args
+    # 8-bit output: a 10-bit source must not become H.264 "High 10" (plays almost nowhere)
+    assert args[args.index("-pix_fmt") + 1] == "yuv420p"
 
 
 def test_webm_is_reencode_only_vp9_opus():
@@ -52,6 +56,8 @@ def test_m4a_remux_copies_aac_and_reencodes_to_aac():
     h = H.get_handler("m4a")
     assert h.can_remux is True and h.kind == "audio"
     assert "copy" in h.remux_out_args("a.mp4")
+    assert "aac_adtstoasc" in h.remux_out_args("a.mkv")    # Auto: AC-3 etc. get encoded
+    assert "aac_adtstoasc" not in h.remux_out_args("a.mkv", aac_only=False)
     args, used = h.reencode_out_args(prefer_hw=False)
     assert used == "aac" and "-vn" in args
 

@@ -6,7 +6,7 @@
 #define AppName "TS to MP4 Converter"
 ; Overridable from the command line: iscc /DAppVersion=1.4.0 installer.iss
 #ifndef AppVersion
-  #define AppVersion "1.7.3"
+  #define AppVersion "1.7.4"
 #endif
 #define AppPublisher "Tanumay Goswami"
 #define AppExe "TSConverter.exe"
@@ -15,7 +15,7 @@
 ; "Uninstalling" and the version answer last, its value cut off (AppVersion is appended).
 ; Same form as tsconverter/feedback.py. Empty = no survey.
 #ifndef FeedbackUrl
-  #define FeedbackUrl ""
+  #define FeedbackUrl "https://docs.google.com/forms/d/e/1FAIpQLSfWqDBaixb86yIZpCTIWi7qgdc51QH50MmLIRZjrljdROA5mQ/viewform?usp=pp_url&entry.1901519186=Uninstalling&entry.645232226="
 #endif
 
 [Setup]

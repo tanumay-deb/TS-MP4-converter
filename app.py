@@ -16,9 +16,9 @@ from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from typing import Optional
 
-from tsconverter import feedback, history, tray, updater
+from tsconverter import feedback, history, storage, tray, updater
 from tsconverter.media import thumbnail
-from tsconverter.media.handlers import REGISTRY, get_handler
+from tsconverter.media.handlers import REGISTRY
 from tsconverter.queue import QueueController
 
 from converter import (
@@ -27,9 +27,9 @@ from converter import (
     Job,
     MODE_LABELS,
     Mode,
-    detect_hw_encoders,
     get_logs_dir,
 )
+from tsconverter.media.hwaccel import working_hw_encoders
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -44,7 +44,7 @@ except ImportError:
     _HAS_SVTTK = False
 
 APP_NAME = "TS to MP4 Converter"
-APP_VERSION = "1.7.3"
+APP_VERSION = "1.7.4"
 SAME_AS_SOURCE = "(same folder as source)"
 
 
@@ -93,8 +93,7 @@ class Settings:
 
     def save(self):
         try:
-            with open(self.PATH, "w", encoding="utf-8") as fp:
-                json.dump(self.data, fp, indent=2)
+            storage.write_json(self.PATH, self.data)
         except OSError:
             pass
 
@@ -145,6 +144,34 @@ def open_in_explorer(path: Path):
         subprocess.Popen(["xdg-open", str(path.parent if path.is_file() else path)])
 
 
+def open_path(path):
+    """Open a file in its default app; os.startfile exists only on Windows."""
+    try:
+        if os.name == "nt":
+            os.startfile(str(path))
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
+    except OSError:
+        open_in_explorer(Path(path))
+
+
+SUPPORTED_EXTS = (".ts", ".m2ts", ".mts", ".mkv", ".mp4", ".mov", ".avi",
+                  ".flv", ".webm", ".wmv", ".m4v", ".mpg", ".mpeg")
+
+
+def find_videos(paths) -> list:
+    """The supported video files among paths; folders are searched recursively."""
+    found = []
+    for p in paths:
+        if os.path.isdir(p):
+            for root, _, files in os.walk(p):
+                found += [os.path.join(root, f) for f in files
+                          if f.lower().endswith(SUPPORTED_EXTS)]
+        elif p.lower().endswith(SUPPORTED_EXTS) and os.path.isfile(p):
+            found.append(p)
+    return found
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -172,6 +199,8 @@ class App:
         self._hidden = False
         self._drag_iid: Optional[str] = None
         self._drag_started: bool = False
+        # One pool for all thumbnail requests, so bursts of adds can't pile up ffmpeg runs.
+        self._thumb_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
         self._setup_window()
         self._build_ui()
@@ -180,12 +209,25 @@ class App:
         # Before the restore-queue prompt (200ms) so that modal lands on top, not under it.
         self.root.after(100, lambda: self.show_whats_new(auto=True))
         self.root.after(200, self._load_queue_if_exists)
+        threading.Thread(target=lambda: storage.prune_old_files(
+            get_logs_dir(), thumbnail._CACHE_DIR), daemon=True).start()
         if self.settings.get("check_updates"):
             self.root.after(1500, lambda: self._check_updates_async(manual=False))
 
     def _setup_window(self):
         self.root.title(APP_NAME)
-        self.root.geometry(self.settings.get("geometry"))
+        # Size only: a saved position on an unplugged monitor opened the window off-screen.
+        size = str(self.settings.get("geometry")).split("+")[0].split("-")[0]
+        try:
+            w, h = (int(v) for v in size.split("x"))
+            # Saved while maximized (or on a bigger monitor): restoring that size hid the
+            # bottom bar under the taskbar. Maximize instead; Windows fits it to the screen.
+            big = w > self.root.winfo_screenwidth() - 160 or h > self.root.winfo_screenheight() - 160
+            self.root.geometry(Settings.DEFAULTS["geometry"] if big else size)
+            if big:
+                self.root.state("zoomed")
+        except (ValueError, tk.TclError):   # hand-edited settings.json; X11 has no "zoomed"
+            self.root.geometry(Settings.DEFAULTS["geometry"])
         self.root.minsize(720, 460)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -285,7 +327,10 @@ class App:
         list_wrap.pack(fill="both", expand=True)
 
         cols = ("file", "size", "duration", "status", "progress", "speed", "eta")
-        self.tree = ttk.Treeview(list_wrap, columns=cols, show="headings", selectmode="extended")
+        # height=3: a small requested size. The default 10 rows x 53px thumbnail rows
+        # outgrew the window, and pack then squeezed out the bottom bar packed after it.
+        self.tree = ttk.Treeview(list_wrap, columns=cols, show="headings", selectmode="extended",
+                                 height=3)
         # (key, label, default width, min width, stretch, anchor). Only File/Status
         # stretch, so window resizes and border drags don't reshuffle numeric columns.
         headings = [
@@ -433,7 +478,7 @@ class App:
         menubar.add_cascade(label="Help", menu=help_menu)
 
     def _initial_status_text(self):
-        hw = detect_hw_encoders()
+        hw = working_hw_encoders()
         if hw:
             return f"Ready  •  GPU encoder available: {hw[0]}"
         return "Ready  •  CPU encoding only"
@@ -445,19 +490,13 @@ class App:
         self.root.dnd_bind("<<Drop>>", self._on_drop)
 
     def _on_drop(self, event):
-        raw = event.data
-        paths = self.root.tk.splitlist(raw)
-        self._add_paths([p for p in paths if os.path.isfile(p)])
-
-    SUPPORTED_EXTS = (".ts", ".m2ts", ".mts", ".mkv", ".mp4", ".mov", ".avi",
-                      ".flv", ".webm", ".wmv", ".m4v", ".mpg", ".mpeg")
+        self._add_videos(self.root.tk.splitlist(event.data))
 
     def add_files(self):
         paths = filedialog.askopenfilenames(
             title="Select video files",
             filetypes=[
-                ("Video files", "*.ts *.m2ts *.mts *.mkv *.mp4 *.mov *.avi "
-                                "*.flv *.webm *.wmv *.m4v *.mpg *.mpeg"),
+                ("Video files", " ".join("*" + e for e in SUPPORTED_EXTS)),
                 ("MPEG-TS files", "*.ts *.m2ts *.mts"),
                 ("Matroska / WebM", "*.mkv *.webm"),
                 ("All files", "*.*"),
@@ -468,20 +507,17 @@ class App:
 
     def add_folder(self):
         d = filedialog.askdirectory(title="Select a folder to scan for video files")
-        if not d:
-            return
-        found = []
-        for root, _, files in os.walk(d):
-            for f in files:
-                if f.lower().endswith(self.SUPPORTED_EXTS):
-                    found.append(os.path.join(root, f))
-        if not found:
-            messagebox.showinfo(
-                "Add folder",
-                f"No supported video files found under:\n{d}",
-            )
-            return
-        self._add_paths(found)
+        if d:
+            self._add_videos([d])
+
+    def _add_videos(self, paths):
+        """Queue the supported videos in paths (files and folders)."""
+        found = find_videos(paths)
+        if found:
+            self._add_paths(found)
+        else:
+            messagebox.showinfo("Add videos", "No supported video files found.\n\n"
+                                "Supported: " + " ".join(SUPPORTED_EXTS))
 
     def _add_paths(self, paths):
         existing = {str(j.src) for j in self.jobs}
@@ -737,8 +773,11 @@ class App:
 
         # Installed Windows builds can download + run the installer directly;
         # dev / portable / other platforms just open the download page.
+        # Installed only (Inno puts unins000.exe beside the exe): from the portable zip,
+        # setup installed a second copy and then relaunched the old portable exe.
         can_self_update = (getattr(sys, "frozen", False) and os.name == "nt"
-                           and bool(info.setup_url))
+                           and bool(info.setup_url)
+                           and any(Path(sys.executable).parent.glob("unins*.exe")))
         if can_self_update:
             self._offer_self_update(info)
             return
@@ -780,6 +819,13 @@ class App:
             for w in btns.winfo_children():
                 w.config(state=state)
 
+        def busy():
+            # The installer closes the app, so never start it mid-conversion.
+            if self.is_running:
+                status.config(text="Finish or cancel the running conversions first.")
+                set_buttons("normal")
+            return self.is_running
+
         def do_skip():
             self.settings.set("skip_update_version", info.version)
             self.settings.save()
@@ -796,10 +842,14 @@ class App:
                 status.config(text="Downloaded file looks wrong (size mismatch).")
                 set_buttons("normal")
                 return
+            if busy():                      # a batch was started during the download
+                return
             status.config(text="Starting installer — the app will close and reopen…")
             self.root.after(400, lambda: self._run_installer_and_quit(dest))
 
         def do_download():
+            if busy():
+                return
             set_buttons("disabled")
             bar.pack(fill="x", pady=(10, 0))
             status.config(text="Downloading…")
@@ -819,9 +869,10 @@ class App:
 
     def _run_installer_and_quit(self, setup_path):
         # Wait for this app to close, run the installer silently, then relaunch.
+        # "&", not "&&": declining the admin prompt fails setup, and the app must still come back.
         app_exe = sys.executable
         cmd = (f'timeout /t 2 /nobreak >nul & "{setup_path}" /SILENT '
-               f'/SUPPRESSMSGBOXES /CLOSEAPPLICATIONS && start "" "{app_exe}"')
+               f'/SUPPRESSMSGBOXES /CLOSEAPPLICATIONS & start "" "{app_exe}"')
         try:
             subprocess.Popen(["cmd", "/c", cmd], creationflags=0x08000000)  # CREATE_NO_WINDOW
         except OSError:
@@ -902,10 +953,7 @@ class App:
             if not entry:
                 return
             if entry.result == "Done" and entry.out and Path(entry.out).exists():
-                try:
-                    os.startfile(entry.out)
-                except OSError:
-                    open_in_explorer(Path(entry.out))
+                open_path(entry.out)
             elif entry.error:
                 self._show_text_dialog(f"Error — {Path(entry.src).name}", entry.error)
         tree.bind("<Double-1>", on_open)
@@ -936,7 +984,8 @@ class App:
         by_enc = Counter((e.encoder or "?") for e in done)
 
         lines = [
-            f"Total conversions : {total}",
+            f"Total conversions : {total}" if total < history.MAX_ENTRIES
+            else f"Last {total} conversions (older ones are not kept)",
             f"  Succeeded       : {len(done)}",
             f"  Failed          : {len(failed)}",
             f"  Success rate    : {len(done) / total * 100:.0f}%",
@@ -959,21 +1008,24 @@ class App:
     _THUMB_W, _THUMB_H = 80, 45     # list-row thumbnail box (16:9)
 
     def _load_thumbs_async(self, jobs, width, on_ready, height=None):
-        """Extract thumbnails 4 at a time; on_ready(job, png_or_None) runs on the UI thread."""
-        jobs = list(jobs)
-        if not jobs:
+        """Extract thumbnails on the shared 4-worker pool; on_ready(job, png_or_None)
+        runs on the UI thread."""
+        futs = {self._thumb_pool.submit(thumbnail.extract_thumbnail, j.src, width, height=height): j
+                for j in jobs}
+        if not futs:
             return
 
+        # Tk calls only from this daemon thread: a pool worker blocked in root.after()
+        # after the window closed deadlocked exit, because Python joins pool workers.
         def work():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                futs = {pool.submit(thumbnail.extract_thumbnail, j.src, width, height=height): j
-                        for j in jobs}
-                for fut in concurrent.futures.as_completed(futs):
-                    try:
-                        png = fut.result()
-                    except Exception:
-                        png = None
-                    self.root.after(0, on_ready, futs[fut], png)
+            for fut in concurrent.futures.as_completed(futs):
+                if fut.cancelled():         # the app is closing
+                    continue
+                try:
+                    png = fut.result()
+                except Exception:
+                    png = None
+                self.root.after(0, on_ready, futs[fut], png)
         threading.Thread(target=work, daemon=True).start()
 
     def _on_thumbs_toggle(self):
@@ -1071,6 +1123,8 @@ class App:
             status_text = "Done" + tail
         elif job.status == "Cancelled":
             status_text = "Cancelled"
+        elif job.status == "Skipped":
+            status_text = "Skipped (output already exists)"
         speed_text = f"{job.speed:.1f}x" if job.speed > 0 and job.status == "Running" else ""
         eta_text = fmt_eta(job.eta_seconds) if job.status == "Running" else ""
         return (
@@ -1127,10 +1181,7 @@ class App:
         if not job:
             return
         if job.status == "Done" and job.out_path:
-            try:
-                os.startfile(str(job.out_path))
-            except OSError:
-                open_in_explorer(job.out_path)
+            open_path(job.out_path)
         elif job.status == "Failed" and (job.error_full or job.error):
             self._show_text_dialog(f"Error — {job.src.name}", job.error_full or job.error)
 
@@ -1188,10 +1239,7 @@ class App:
             return
         job = self.job_by_iid.get(sel[0])
         if job and job.out_path and job.out_path.exists():
-            try:
-                os.startfile(str(job.out_path))
-            except OSError:
-                open_in_explorer(job.out_path)
+            open_path(job.out_path)
 
     def open_log_file(self):
         sel = self.tree.selection()
@@ -1205,10 +1253,7 @@ class App:
                 "A log is written after each conversion attempt.",
             )
             return
-        try:
-            os.startfile(str(job.log_path))
-        except OSError:
-            open_in_explorer(job.log_path)
+        open_path(job.log_path)
 
     def show_in_folder(self):
         sel = self.tree.selection()
@@ -1260,12 +1305,16 @@ class App:
         job = self.job_by_iid.get(sel[0])
         if not job:
             return
-        from converter import FFMPEG_PATH, CREATE_NO_WINDOW
-        proc = subprocess.run(
-            [FFMPEG_PATH, "-hide_banner", "-i", str(job.src)],
-            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW,
-        )
-        info = (proc.stderr or proc.stdout or "(no output)").strip()
+        from converter import FFMPEG_PATH, CREATE_NO_WINDOW, ts_input_opts
+        skip = ts_input_opts(job.src)       # junk-header .ts: read it the way conversion does
+        try:
+            proc = subprocess.run(
+                [FFMPEG_PATH, "-hide_banner", *skip, "-i", str(job.src)],
+                capture_output=True, text=True, creationflags=CREATE_NO_WINDOW, timeout=30,
+            )
+            info = (proc.stderr or proc.stdout or "(no output)").strip()
+        except subprocess.TimeoutExpired:   # e.g. a network drive that stopped answering
+            info = "ffmpeg gave no answer within 30 seconds."
 
         magic = ""
         try:
@@ -1275,7 +1324,10 @@ class App:
             ascii_p = "".join(chr(b) if 32 <= b < 127 else "." for b in head)
             magic = f"\n\n--- First 16 bytes ---\nhex:   {hex_p}\nascii: {ascii_p}\n"
             ext = job.src.suffix.lower()
-            if head[:1] == b"\x47":
+            if skip:
+                magic += (f"MPEG-TS after {skip[1]} bytes of junk header. "
+                          "Conversion skips the junk automatically.\n")
+            elif head[:1] == b"\x47":
                 magic += "MPEG-TS (0x47 sync byte present).\n"
             elif head[4:8] == b"ftyp":
                 magic += f"MP4/QuickTime container — wrong {ext} extension?\n"
@@ -1310,30 +1362,88 @@ class App:
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
 
     def show_whats_new(self, auto=False):
-        """Help > What's new. auto=True: only on the first launch of a new version."""
+        """Help > What's new. auto=True: only on the first launch of a new version, then
+        listing every version since the one this user last saw."""
+        last_seen = ""
         if auto:
-            if self.settings.get("last_seen_version") == APP_VERSION:
+            last_seen = str(self.settings.get("last_seen_version") or "")
+            if last_seen == APP_VERSION:
                 return
             self.settings.set("last_seen_version", APP_VERSION)
             self.settings.save()
         # Frozen builds bundle CHANGELOG.md at the bundle root (see TSConverter.spec).
         base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
         try:
-            notes = updater.release_notes(APP_VERSION,
-                                          (base / "CHANGELOG.md").read_text(encoding="utf-8"))
+            sections = updater.notes_since(last_seen, APP_VERSION,
+                                           (base / "CHANGELOG.md").read_text(encoding="utf-8"))
         except OSError:
-            notes = ""
-        if notes or not auto:
-            self._show_text_dialog(
-                f"What's new in version {APP_VERSION}",
-                notes or "No release notes are bundled with this build.\n\nSee "
-                         "https://github.com/tanumay-deb/TS-MP4-converter/releases")
+            sections = []
+        sections = sections[:2]         # newest 2: keeps the window on screen after a long gap
+        if not sections:
+            if not auto:
+                messagebox.showinfo("What's new", "Release notes aren't included in this build.\n\n"
+                                    "See https://github.com/tanumay-deb/TS-MP4-converter/releases")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("What's new")
+        win.transient(self.root)
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=(24, 20, 24, 16))
+        body.pack(fill="both", expand=True)
+        base_font = tkfont.nametofont("TkDefaultFont").actual()
+        self._heading_font = tkfont.Font(family=base_font["family"],     # ref: Tk drops it on GC
+                                         size=base_font["size"] + 4, weight="bold")
+        self._bold_font = tkfont.Font(family=base_font["family"], size=base_font["size"],
+                                      weight="bold")
+        many = len(sections) > 1
+        ttk.Label(body, text="What's new" if many else f"What's new in version {APP_VERSION}",
+                  font=self._heading_font).pack(anchor="w", pady=(0, 12))
+        ok = ttk.Button(body, text="Got it", command=win.destroy,
+                        style="Accent.TButton" if _HAS_SVTTK else "TButton")
+        ok.pack(side="bottom", anchor="e", pady=(16, 0))
+        # The notes scroll when taller than the screen allows: two versions' notes pushed
+        # "Got it" off a 1080p screen.
+        canvas = tk.Canvas(body, highlightthickness=0, borderwidth=0,
+                           background=ttk.Style().lookup("TFrame", "background"))
+        notes = ttk.Frame(canvas)
+        canvas.create_window(0, 0, window=notes, anchor="nw")
+        row = 0
+        for version, items in sections:
+            if many:
+                ttk.Label(notes, text=f"Version {version}", font=self._bold_font).grid(
+                    row=row, column=0, columnspan=2, sticky="w", pady=(8 if row else 0, 2))
+                row += 1
+            for item in items:                          # bullet column = hanging indent
+                ttk.Label(notes, text="•").grid(row=row, column=0, sticky="nw", padx=(0, 8),
+                                                pady=3)
+                ttk.Label(notes, text=item, wraplength=440, justify="left").grid(
+                    row=row, column=1, sticky="w", pady=3)
+                row += 1
+        notes.update_idletasks()
+        w, h = notes.winfo_reqwidth(), notes.winfo_reqheight()
+        fit = min(h, win.winfo_screenheight() - 300)    # title bar, heading, button, taskbar
+        canvas.config(width=w, height=fit, scrollregion=(0, 0, w, h))
+        if fit < h:
+            sb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+            canvas.config(yscrollcommand=sb.set)
+            sb.pack(side="right", fill="y", padx=(8, 0))
+            win.bind("<MouseWheel>",
+                     lambda e: canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        canvas.pack(side="left", fill="both", expand=True)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Return>", lambda e: win.destroy())
+        ok.focus_set()
+        win.update_idletasks()                          # centre over the main window
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")       # may be negative: monitors left of/above the main one
 
     def send_feedback(self):
         webbrowser.open(feedback.form_url(APP_VERSION))
 
     def _show_about(self):
-        hw = detect_hw_encoders()
+        hw = working_hw_encoders()
         hw_text = ", ".join(hw) if hw else "none detected"
         try:
             logs_path = str(get_logs_dir())
@@ -1356,13 +1466,12 @@ class App:
     def _save_queue(self):
         pending = [
             {"src": str(j.src), "status": j.status}
-            for j in self.jobs if j.status != "Done"
+            for j in self.jobs if j.status not in ("Done", "Skipped")
         ]
         path = self._queue_path()
         try:
             if pending:
-                with open(path, "w", encoding="utf-8") as fp:
-                    json.dump({"version": 1, "files": pending}, fp, indent=2)
+                storage.write_json(path, {"version": 1, "files": pending})
             elif path.exists():
                 path.unlink()
         except OSError:
@@ -1455,13 +1564,15 @@ class App:
             self.tray.stop()
             self.tray = None
         try:
-            self.settings.set("geometry", self.root.geometry())
+            self.settings.set("geometry", self.root.geometry().split("+")[0].split("-")[0])
             self.settings.set("col_widths", {c: self.tree.column(c, "width")
                                              for c in self.tree["columns"]})
             self.settings.save()
             self._save_queue()
         except Exception:
             pass
+        # Drop queued thumbnails; otherwise Python waits for all of them before exiting.
+        self._thumb_pool.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
 

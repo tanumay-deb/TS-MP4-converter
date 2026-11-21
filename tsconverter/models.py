@@ -86,6 +86,7 @@ class ConversionResult:
     verify_message: Optional[str] = None
     error: Optional[str] = None
     error_full: Optional[str] = None
+    disk_full: bool = False        # failed because the output drive ran out of space
     log_lines: list = field(default_factory=list)
     log_path: Optional[Path] = None
     started_at: float = 0.0

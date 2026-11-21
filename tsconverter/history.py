@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional
 
+from .storage import write_json
+
 MAX_ENTRIES = 500
 
 
@@ -65,7 +67,6 @@ class HistoryStore:
     def _save(self, entries: list) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as fp:
-                json.dump({"version": 1, "entries": entries}, fp, indent=2)
+            write_json(self.path, {"version": 1, "entries": entries})
         except OSError:
             pass

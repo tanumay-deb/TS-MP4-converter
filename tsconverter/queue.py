@@ -77,13 +77,15 @@ class QueueController:
         n_workers = min(n_workers, total)
         counts = {"done": 0, "fail": 0, "cancel": 0, "completed": 0}
         lock = threading.Lock()
+        running, overlapped = set(), set()   # ids of jobs converting now / alongside another
+        retry_alone: List[Job] = []
 
         def update_overall():
             with lock:
                 pct = counts["completed"] / total * 100
             self._set_overall(pct)
 
-        def worker(job: Job):
+        def worker(job: Job, alone: bool = False):
             # Queue-level pause: a not-yet-started job waits here while paused.
             # Jobs already running keep going; only new starts are held back.
             while self.pause_event.is_set() and not self.cancel_event.is_set():
@@ -103,6 +105,11 @@ class QueueController:
 
             job.status = "Running"
             self._refresh(job)
+            with lock:
+                if running:
+                    overlapped.update(running)
+                    overlapped.add(id(job))
+                running.add(id(job))
 
             def on_progress(ev, j=job):
                 j.apply_progress(ev)
@@ -112,11 +119,25 @@ class QueueController:
             # onto the Job here. pause_event also suspends a running ffmpeg.
             result = self._converter.convert(
                 job.to_request(), on_progress, self.cancel_event, self.pause_event)
+            with lock:
+                running.discard(id(job))
+            if result.disk_full and not alone and id(job) in overlapped:
+                # Parallel jobs share the drive's free space: one that ran out of room
+                # alongside others may fit alone, so retry it after them, one at a time.
+                job.status, job.stage, job.progress_pct = (
+                    "Queued", "Waiting to retry alone (drive was full)", 0.0)
+                self._refresh(job)
+                with lock:
+                    retry_alone.append(job)
+                return
             job.apply_result(result)
             if result.status in (JobStatus.DONE, JobStatus.FAILED):
                 self._record(job, result)
 
-            if result.status == JobStatus.DONE:
+            if result.status == JobStatus.SKIPPED:     # output already there: not a failure
+                with lock:
+                    counts["done"] += 1
+            elif result.status == JobStatus.DONE:
                 with lock:
                     counts["done"] += 1
                 if (self._should_delete()
@@ -135,7 +156,7 @@ class QueueController:
                         job.out_path.unlink()
                     except OSError:
                         pass
-            else:  # FAILED / SKIPPED
+            else:  # FAILED
                 with lock:
                     counts["fail"] += 1
 
@@ -148,5 +169,8 @@ class QueueController:
             max_workers=n_workers, thread_name_prefix="ffmpeg-worker"
         ) as pool:
             list(pool.map(worker, pending))
+        for job in retry_alone:              # one at a time, now that the others are done
+            worker(job, alone=True)
 
+        self._converter.end_batch([j.out_path for j in pending])
         self._finished(counts["done"], counts["fail"], counts["cancel"], total)

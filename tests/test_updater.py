@@ -13,13 +13,21 @@ def test_is_newer_handles_two_and_three_part_versions():
     assert not u.is_newer("garbage", "1.4.0")
 
 
-def test_release_notes_extracts_one_version_as_plain_text():
+def test_release_notes_extracts_one_version_as_plain_bullets():
     md = ("# Changelog\n\n## Unreleased\n- wip\n\n"
-          "## v1.2.0 (2026-01-01)\n- **Bold** `code`\n- two\n\n## v1.1.0\n- old\n")
-    assert u.release_notes("1.2.0", md) == "- Bold code\n- two"
-    assert u.release_notes("1.1.0", md) == "- old"
-    assert u.release_notes("1.2", md) == ""
-    assert u.release_notes("9.9.9", md) == ""
+          "## v1.2.0 (2026-01-01)\n- **Bold** `code`\n  wrapped on\n- two\n\n## v1.1.0\n- old\n")
+    assert u.release_notes("1.2.0", md) == ["Bold code wrapped on", "two"]
+    assert u.release_notes("1.1.0", md) == ["old"]
+    assert u.release_notes("1.2", md) == []
+    assert u.release_notes("9.9.9", md) == []
+
+
+def test_notes_since_covers_skipped_versions():
+    md = "## v1.3.0\n- c\n\n## v1.2.0\n- b\n\n## v1.1.0\n- a\n"
+    assert u.notes_since("1.1.0", "1.3.0", md) == [("1.3.0", ["c"]), ("1.2.0", ["b"])]
+    assert u.notes_since("", "1.3.0", md) == [("1.3.0", ["c"])]        # unknown: current only
+    assert u.notes_since("1.3.0", "1.3.0", md) == [("1.3.0", ["c"])]
+    assert u.notes_since("9.0.0", "1.3.0", md) == [("1.3.0", ["c"])]   # downgrade
 
 
 def test_changelog_has_notes_for_current_version():

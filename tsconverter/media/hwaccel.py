@@ -19,7 +19,8 @@ from .ffmpeg import CREATE_NO_WINDOW, FFMPEG_PATH
 _CANDIDATES = {
     "Windows": ["h264_nvenc", "h264_qsv", "h264_amf"],
     "Darwin": ["h264_videotoolbox"],
-    "Linux": ["h264_nvenc", "h264_qsv", "h264_vaapi"],
+    # No h264_vaapi: it needs -vaapi_device + hwupload, so this plain test never passes.
+    "Linux": ["h264_nvenc", "h264_qsv"],
 }
 
 _WORKING_CACHE: Optional[List[str]] = None
@@ -27,9 +28,12 @@ _WORKING_CACHE: Optional[List[str]] = None
 
 def _encoder_runs(encoder: str) -> bool:
     """True only if ffmpeg can actually encode a frame with this encoder."""
+    # 640x360, not tiny: NVENC rejects frames below its minimum size ("Frame Dimension
+    # less than the minimum supported value") and AMF fails on 128x72 too, so a tiny
+    # test frame reported working GPUs as missing.
     cmd = [
         FFMPEG_PATH, "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "testsrc=duration=0.1:size=128x72:rate=5",
+        "-f", "lavfi", "-i", "testsrc=duration=0.1:size=640x360:rate=5",
         "-frames:v", "1", "-c:v", encoder, "-f", "null", "-",
     ]
     try:

@@ -12,10 +12,8 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-# Binary resolution, probing and HW detection now live in the tsconverter
-# package. Re-exported here so existing `from converter import ...` users keep
-# working during the incremental refactor.
-from tsconverter.media import hwaccel
+# Binary resolution and probing live in the tsconverter package. The ffmpeg
+# paths and models are re-exported here so `from converter import ...` keeps working.
 from tsconverter.media.ffmpeg import (  # noqa: F401  (re-exported)
     CREATE_NO_WINDOW,
     FFMPEG_PATH,
@@ -37,7 +35,8 @@ from tsconverter.models import (  # noqa: F401  (re-exported for compatibility)
     ProgressEvent,
 )
 
-_CTX_PREFIX_RE = re.compile(r"^\[[^\]]+@\s*[0-9a-fx]+\]\s*", re.IGNORECASE)
+# ffmpeg 8 nests them: "[aost#0:0/libopus @ 0x..] [enc:libopus @ 0x..] Could not ..."
+_CTX_PREFIX_RE = re.compile(r"^(?:\[[^\]]+@\s*[0-9a-fx]+\]\s*)+", re.IGNORECASE)
 _SAFE_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -139,9 +138,17 @@ def extract_error(stderr: str) -> str:
                 "unable", "failed", "unsupported", "malformed", "denied")
     for ln in reversed(lines):
         low = ln.lower()
-        if any(k in low for k in keywords) and not low.startswith("conversion failed"):
+        if any(k in low for k in keywords) and not low.startswith(_GENERIC_ERRORS):
             return ln
     return lines[-1]
+
+
+# ffmpeg 7 ends every failure with these wrap-up lines; the cause comes before them
+# (shown alone, they told users only "Terminating thread with return code -22").
+_GENERIC_ERRORS = ("conversion failed", "terminating thread", "task finished with error",
+                   "error sending frames", "error while opening encoder",
+                   "error opening output file", "error while filtering",
+                   "could not open encoder before eof", "nothing was written")
 
 
 def ts_input_opts(src: Path) -> list[str]:
@@ -165,30 +172,60 @@ def probe_duration(src: Path) -> Optional[float]:
     return info.duration or None
 
 
-def detect_hw_encoders() -> list[str]:
-    """H.264 hardware encoders that actually work (verified by test-encode)."""
-    return hwaccel.working_hw_encoders()
+_claimed: set = set()            # output paths reserved by conversions still running
+_claim_lock = threading.Lock()
 
 
-def best_h264_encoder(prefer_hw: bool = True) -> str:
-    return hwaccel.best_h264_encoder(prefer_hw)
+def _key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(path))    # Windows paths ignore case
 
 
 def resolve_output_path(src: Path, out_dir: Path, policy: ConflictPolicy,
                         ext: str = ".mp4") -> Optional[Path]:
+    """Pick and reserve the output path; free it with release_output_path().
+
+    Parallel jobs check before either writes, so two sources with the same name
+    (clip.ts in two folders, or clip.ts + clip.mkv) both got clip.mp4. A path that
+    another running job reserved, or the source itself, is taken under every policy.
+    """
     candidate = out_dir / (src.stem + ext)
-    if not candidate.exists():
-        return candidate
-    if policy == ConflictPolicy.OVERWRITE:
-        return candidate
-    if policy == ConflictPolicy.SKIP:
-        return None
-    n = 1
-    while True:
-        c = out_dir / f"{src.stem} ({n}){ext}"
-        if not c.exists():
-            return c
-        n += 1
+    with _claim_lock:
+        if _key(candidate) not in _claimed and _key(candidate) != _key(src):
+            if not candidate.exists() or policy == ConflictPolicy.OVERWRITE:
+                _claimed.add(_key(candidate))
+                return candidate
+            if policy == ConflictPolicy.SKIP:
+                return None
+        n = 1
+        while True:
+            c = out_dir / f"{src.stem} ({n}){ext}"
+            if _key(c) not in _claimed and not c.exists():
+                _claimed.add(_key(c))
+                return c
+            n += 1
+
+
+def release_output_path(path: Optional[Path]) -> None:
+    if path is not None:
+        with _claim_lock:
+            _claimed.discard(_key(path))
+
+
+class _OutputExists(Exception):
+    """Skip policy, and the output file already exists."""
+
+
+class _DiskFull(ConversionError):
+    """ffmpeg ran out of disk space. Never retried: a re-encode that happens to fit
+    silently swapped a lossless copy for a smaller, worse file (even over an old one)."""
+
+
+def _discard(path: Optional[Path]) -> None:
+    try:
+        if path is not None:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 class _Ctx:
@@ -219,6 +256,13 @@ class _Ctx:
 class Converter:
     def __init__(self, prefer_hw: bool = True):
         self.prefer_hw = prefer_hw
+
+    @staticmethod
+    def end_batch(out_paths) -> None:
+        """Free the outputs a batch made. Until then a later job with the same name gets
+        "name (1)", even with Overwrite, instead of replacing a file this batch made."""
+        for p in out_paths:
+            release_output_path(p)
 
     @staticmethod
     def _emitter(ctx: "_Ctx", on_progress):
@@ -259,6 +303,9 @@ class Converter:
         status = JobStatus.DONE
         error_short = error_full = verify_message = None
         verify_ok = True
+        keep_part = False       # the .part file is kept only when the message points to it
+        disk_full = False
+        final_path = None
 
         try:
             if cancel_event.is_set():
@@ -276,11 +323,13 @@ class Converter:
             ctx.log_lines.append(f"Format:   {handler.id} ({handler.kind})")
 
             ctx.out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = resolve_output_path(ctx.src, ctx.out_dir, ctx.conflict, handler.ext)
-            if out_path is None:
-                raise ConversionError("Output exists; skipped")
-            ctx.out_path = out_path
-            ctx.log_lines.append(f"Output:   {out_path}")
+            final_path = resolve_output_path(ctx.src, ctx.out_dir, ctx.conflict, handler.ext)
+            if final_path is None:
+                raise _OutputExists()
+            ctx.log_lines.append(f"Output:   {final_path}")
+            # ffmpeg writes a .part file that replaces final_path only once verified,
+            # so a failed or cancelled run never destroys an existing file (Overwrite).
+            ctx.out_path = final_path.with_name(f"{final_path.stem}.part{final_path.suffix}")
 
             if cancel_event.is_set():
                 raise CancelledError()
@@ -299,11 +348,9 @@ class Converter:
                 except ConversionError as e:
                     if cancel_event.is_set():
                         raise CancelledError()
-                    if ctx.out_path and ctx.out_path.exists():
-                        try:
-                            ctx.out_path.unlink()
-                        except OSError:
-                            pass
+                    if isinstance(e, _DiskFull):
+                        raise
+                    _discard(ctx.out_path)
                     ctx.stage = "Re-encoding (remux failed, retrying)"
                     ctx.log_lines.append(f"Remux failed: {e.short} — retrying with re-encode")
                     emit()
@@ -315,34 +362,51 @@ class Converter:
                             f"Remux failed: {e.full}\n\nRe-encode failed: {e2.full}",
                         )
 
+            if cancel_event.is_set():
+                raise CancelledError()
             # Output verification (quick probe — sub-second on most files)
-            if not cancel_event.is_set() and ctx.out_path and ctx.out_path.exists():
-                ctx.stage = "Verifying output"
-                emit()
-                ok, msg = verify_output(ctx.out_path, ctx.duration,
-                                        expect_video=handler.expects_video())
-                verify_message = msg
-                ctx.log_lines.append(f"Verify:   {msg}")
-                if not ok:
-                    verify_ok = False
-                    raise ConversionError(
-                        f"Verify failed: {msg}",
-                        f"Output file failed post-conversion verification.\n{msg}\n\n"
-                        f"The output file was kept at:\n{ctx.out_path}",
-                    )
+            ctx.stage = "Verifying output"
+            emit()
+            ok, msg = verify_output(ctx.out_path, ctx.duration,
+                                    expect_video=handler.expects_video())
+            verify_message = msg
+            ctx.log_lines.append(f"Verify:   {msg}")
+            if not ok:
+                verify_ok = False
+                keep_part = True
+                raise ConversionError(
+                    f"Verify failed: {msg}",
+                    f"Output file failed post-conversion verification.\n{msg}\n\n"
+                    f"The output file was kept at:\n{ctx.out_path}",
+                )
+            try:
+                os.replace(ctx.out_path, final_path)
+            except OSError as e:     # e.g. the old file is open in a player
+                keep_part = True
+                raise ConversionError(f"Could not save {final_path.name}: {e}",
+                                      f"The converted file was kept at:\n{ctx.out_path}\n\n{e}")
+            ctx.out_path = final_path
+        except _OutputExists:
+            status = JobStatus.SKIPPED
+            ctx.log_lines.append("SKIPPED: output already exists")
         except CancelledError:
             status = JobStatus.CANCELLED
             ctx.log_lines.append("CANCELLED")
         except ConversionError as e:
             status = JobStatus.FAILED
             error_short, error_full = e.short, e.full
+            disk_full = isinstance(e, _DiskFull)
             if verify_ok:
                 ctx.log_lines.append(f"FAILED: {e.short}")
         except Exception as e:  # noqa: BLE001 - report unexpected errors as a result
             status = JobStatus.FAILED
             error_short = error_full = f"{type(e).__name__}: {e}"
             ctx.log_lines.append(f"FAILED: {error_short}")
+        if status == JobStatus.FAILED and not keep_part:
+            _discard(ctx.out_path)      # a partial file is useless; on a full disk it kept it full
 
+        if status != JobStatus.DONE:     # a made output stays reserved until end_batch()
+            release_output_path(final_path)
         completed_at = time.time()
         if status == JobStatus.DONE:
             ctx.log_lines.append(f"Done in {completed_at - started_at:.1f}s")
@@ -356,6 +420,7 @@ class Converter:
             verify_message=verify_message,
             error=error_short,
             error_full=error_full,
+            disk_full=disk_full,
             log_lines=ctx.log_lines,
             log_path=log_path,
             started_at=started_at,
@@ -385,20 +450,30 @@ class Converter:
 
     def _remux(self, ctx, on_update, cancel_event, handler):
         cmd = (self._input_cmd(ctx)
-               + handler.remux_out_args(ctx.src)
+               + handler.remux_out_args(ctx.src, aac_only=ctx.mode != Mode.REMUX)
                + self._output_tail(ctx.out_path))
         self._run(cmd, ctx, on_update, cancel_event, stage="Remuxing")
         ctx.actually_used = "remux"
 
-    def _reencode(self, ctx, on_update, cancel_event, handler):
-        out_args, used = handler.reencode_out_args(self.prefer_hw)
+    def _reencode(self, ctx, on_update, cancel_event, handler, prefer_hw=None):
+        out_args, used = handler.reencode_out_args(
+            self.prefer_hw if prefer_hw is None else prefer_hw)
         cmd = self._input_cmd(ctx) + out_args + self._output_tail(ctx.out_path)
+        is_hw = handler.kind == "video" and used not in ("libx264", "libvpx-vp9")
         if handler.kind == "video":
-            is_hw = used not in ("libx264", "libvpx-vp9")
             stage = f"Re-encoding ({'GPU: ' + used if is_hw else 'CPU'})"
         else:
             stage = f"Encoding audio ({used})"
-        self._run(cmd, ctx, on_update, cancel_event, stage=stage)
+        try:
+            self._run(cmd, ctx, on_update, cancel_event, stage=stage)
+        except ConversionError as e:
+            if not is_hw or isinstance(e, _DiskFull):
+                raise
+            # The 1-frame startup test can't catch everything (e.g. NVENC's limit on
+            # parallel sessions), so retry once on the CPU.
+            ctx.log_lines.append(f"GPU encoder {used} failed ({e.short}); retrying on CPU")
+            self._reencode(ctx, on_update, cancel_event, handler, prefer_hw=False)
+            return
         ctx.actually_used = used
 
     def _run(self, cmd, ctx, on_update, cancel_event: threading.Event,
@@ -555,5 +630,12 @@ class Converter:
             )
         if proc.returncode != 0:
             err_full = "".join(stderr_buf).strip()
+            if "no space left on device" in err_full.lower():
+                raise _DiskFull(
+                    f"Not enough free space in {ctx.out_dir}",
+                    f"The output folder's drive ran out of space.\n\nFree up space or pick "
+                    f"another output folder. Converting fewer files at once (Parallel) can "
+                    f"help too. With \"If exists: Overwrite\", the old file stays until the "
+                    f"new one is complete, so both must fit.\n\n{err_full}")
             short = extract_error(err_full) or f"ffmpeg exit {proc.returncode}"
             raise ConversionError(short, err_full)

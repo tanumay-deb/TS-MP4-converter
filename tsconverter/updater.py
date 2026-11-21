@@ -40,18 +40,34 @@ def is_newer(latest: str, current: str) -> bool:
     return a > b
 
 
-def release_notes(version: str, changelog: str) -> str:
-    """Plain-text notes for `version` from CHANGELOG.md text ("## v1.2.3" sections)."""
-    out, inside = [], False
+def release_notes(version: str, changelog: str) -> list:
+    """Bullet items of the "## v1.2.3" section of CHANGELOG.md text, as plain text."""
+    items, inside = [], False
     for line in changelog.splitlines():
         if line.startswith("## "):
             if inside:
                 break
             words = line[3:].split()
             inside = bool(words) and words[0].lstrip("v") == version
-        elif inside:
-            out.append(line.replace("**", "").replace("`", ""))
-    return "\n".join(out).strip()
+        elif inside and line.strip():
+            text = line.strip().replace("**", "").replace("`", "")
+            if text.startswith("- "):
+                items.append(text[2:])
+            elif items:
+                items[-1] += " " + text           # hard-wrapped continuation line
+            else:
+                items.append(text)
+    return items
+
+
+def notes_since(last_seen: str, current: str, changelog: str) -> list:
+    """[(version, items)], newest first: every version after last_seen up to current,
+    so someone who skipped releases sees those notes too. Just `current` when
+    last_seen is unknown, the same, or newer."""
+    versions = [v for v in re.findall(r"^## v(\S+)", changelog, re.M)
+                if is_newer(v, last_seen) and not is_newer(v, current)]
+    sections = [(v, release_notes(v, changelog)) for v in versions or [current]]
+    return [(v, items) for v, items in sections if items]
 
 
 def check_for_update(current_version: str, timeout: float = 8.0) -> Optional[UpdateInfo]:

@@ -38,6 +38,8 @@ Write-Host "==> Ensuring bundled ffmpeg + ffprobe (shared build)" -ForegroundCol
 # exes + shared DLLs keep the size far below a standalone static ffprobe.
 $ffVersion = "8.1.2"
 $ffName = "ffmpeg-$ffVersion-full_build-shared"
+# SHA256 of $ffName.zip, as GitHub records it for the release asset. Update with $ffVersion.
+$ffSha256 = "274923C68904A9B76C73B908F57923DAFBA81155856CD742138515DED570D066"
 $binDir = "bin"
 if ((Test-Path "$binDir\ffmpeg.exe") -and (Test-Path "$binDir\ffprobe.exe")) {
     Write-Host "    already present in $binDir\" -ForegroundColor DarkGray
@@ -50,8 +52,10 @@ if ((Test-Path "$binDir\ffmpeg.exe") -and (Test-Path "$binDir\ffprobe.exe")) {
         Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
     }
     $sha = (Get-FileHash $zip -Algorithm SHA256).Hash
-    Write-Host "    SHA256 $sha" -ForegroundColor DarkGray
-    Write-Host "    ^ verify against https://github.com/GyanD/codexffmpeg/releases/tag/$ffVersion" -ForegroundColor DarkGray
+    if ($sha -ne $ffSha256) {
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+        throw "ffmpeg download hash mismatch: got $sha, expected $ffSha256"
+    }
     $tmp = Join-Path $env:TEMP $ffName
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
     Expand-Archive -Path $zip -DestinationPath $tmp -Force

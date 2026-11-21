@@ -69,6 +69,17 @@ def test_hwaccel_lists_only_encoders_that_run(monkeypatch):
     assert hwaccel.best_h264_encoder() == "h264_qsv"
 
 
+def test_hwaccel_test_frame_is_big_enough_for_gpu_encoders(monkeypatch):
+    # NVENC and AMF reject tiny frames; a 128x72 test hid every NVIDIA/AMD GPU.
+    seen = []
+    monkeypatch.setattr(hwaccel.subprocess, "run",
+                        lambda cmd, **kw: seen.append(cmd) or _fake_run("", "")(cmd))
+    hwaccel._encoder_runs("h264_nvenc")
+    size = next(a for a in seen[0] if "size=" in a).split("size=")[1].split(":")[0]
+    w, h = map(int, size.split("x"))
+    assert w >= 320 and h >= 180
+
+
 def test_hwaccel_falls_back_to_libx264_when_none_work(monkeypatch):
     hwaccel._WORKING_CACHE = None
     monkeypatch.setattr(hwaccel.platform, "system", lambda: "Windows")
