@@ -76,8 +76,10 @@ def _probe_ffprobe(src, skip_bytes: int) -> Optional[MediaInfo]:
     cmd = [FFPROBE_PATH, "-v", "quiet", "-print_format", "json",
            "-show_format", "-show_streams", *_skip_opts(skip_bytes), str(src)]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              creationflags=CREATE_NO_WINDOW, timeout=30)
+        # UTF-8: the JSON holds the file name, and the Windows default (cp1252) failed on
+        # names like "●", so probing (and the output check) saw no streams at all.
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", creationflags=CREATE_NO_WINDOW, timeout=30)
     except (subprocess.SubprocessError, OSError):
         return None
     if proc.returncode != 0 or not proc.stdout:
@@ -120,8 +122,8 @@ def _probe_ffprobe(src, skip_bytes: int) -> Optional[MediaInfo]:
 def _probe_ffmpeg(src, skip_bytes: int) -> MediaInfo:
     cmd = [FFMPEG_PATH, "-hide_banner", *_skip_opts(skip_bytes), "-i", str(src)]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              creationflags=CREATE_NO_WINDOW, timeout=30)
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", creationflags=CREATE_NO_WINDOW, timeout=30)
     except (subprocess.SubprocessError, OSError):
         return MediaInfo(source="none")
     stderr = proc.stderr or ""

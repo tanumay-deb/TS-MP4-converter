@@ -190,6 +190,66 @@ def test_disk_full_fails_clearly_without_retries_or_leftovers(tmp_path, monkeypa
         assert list((tmp_path / "out").iterdir()) == []      # partial file removed
 
 
+def test_names_outside_the_windows_code_page_convert(tmp_path, monkeypatch):
+    # ffprobe prints the file name as UTF-8; read as cp1252 it failed on "●", so probing
+    # found nothing: no length, and a good output was reported as "Verify failed".
+    monkeypatch.setattr(c, "get_logs_dir", lambda: tmp_path)
+    src = tmp_path / "clip ●● 日本.mkv"
+    _make_clip(src)
+    r = _convert(src, tmp_path / "out", mode=Mode.AUTO)
+    assert r.status == JobStatus.DONE, r.error
+    assert r.duration > 0.5
+
+
+class _ScriptedFfmpeg:
+    """Prints [(pause_s, line)] progress lines, then exits 0. kill() stops it."""
+    def __init__(self, script):
+        self.returncode = None
+        self._done = threading.Event()
+        self.stderr = iter(())
+
+        def lines():
+            for pause, line in script:
+                if self._done.wait(pause):          # killed
+                    return
+                yield line + "\n"
+            self.returncode = 0
+            self._done.set()
+        self.stdout = lines()
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if not self._done.wait(timeout):
+            raise subprocess.TimeoutExpired("ffmpeg", timeout)
+        return self.returncode
+
+    def kill(self):
+        self.returncode = 1
+        self._done.set()
+
+
+def _run_scripted(monkeypatch, script):
+    monkeypatch.setattr(c.subprocess, "Popen", lambda cmd, **kw: _ScriptedFfmpeg(script))
+    ctx = c._Ctx(ConversionRequest(src=Path("x.ts"), out_dir=Path("."), duration=10.0))
+    c.Converter()._run(["ffmpeg"], ctx, lambda: None, threading.Event(),
+                       stage="Remuxing", stall_timeout=1.0)
+
+
+def test_silence_while_finishing_is_not_a_stall(monkeypatch):
+    # After the last frame +faststart rewrites the whole file and prints nothing; for
+    # 3 GB on a busy disk that took over 45s, and the job was killed "Stalled at 100%".
+    _run_scripted(monkeypatch, [(0.05, "out_time_ms=5000000"), (0.05, "out_time_ms=10000000"),
+                                (2.5, "progress=end")])
+
+
+def test_reports_without_progress_are_a_stall(monkeypatch):
+    script = [(0.05, "out_time_ms=5000000")] + [(0.1, "out_time_ms=5000000")] * 30
+    with pytest.raises(c.ConversionError, match="Stalled"):
+        _run_scripted(monkeypatch, script)
+
+
 def test_failed_overwrite_keeps_the_existing_file(tmp_path, monkeypatch):
     monkeypatch.setattr(c, "get_logs_dir", lambda: tmp_path)
     src = tmp_path / "clip.ts"

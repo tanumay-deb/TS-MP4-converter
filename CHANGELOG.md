@@ -3,6 +3,14 @@
 All notable changes to this project. Releases are also published (with installers)
 on the [Releases](https://github.com/tanumay-deb/TS-MP4-converter/releases) page.
 
+## v1.7.5
+- Fixed: long recordings no longer fail with "Stalled at 99%" or "Stalled at 100%".
+  The app now waits while the finished file is being written.
+- Fixed: files with special characters in their name (like ● or Japanese letters) no
+  longer show no length or fail with "Verify failed: … no streams found". If version
+  1.7.4 left a "….part.mp4" file after that error, the file is fine: remove ".part"
+  from its name.
+
 ## v1.7.4
 - Tell us what you think: click **Send feedback** at the bottom of the window, or go to
   Help → Send feedback. It takes under a minute and is anonymous.

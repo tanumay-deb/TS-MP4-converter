@@ -44,7 +44,7 @@ except ImportError:
     _HAS_SVTTK = False
 
 APP_NAME = "TS to MP4 Converter"
-APP_VERSION = "1.7.4"
+APP_VERSION = "1.7.5"
 SAME_AS_SOURCE = "(same folder as source)"
 
 
@@ -1310,7 +1310,8 @@ class App:
         try:
             proc = subprocess.run(
                 [FFMPEG_PATH, "-hide_banner", *skip, "-i", str(job.src)],
-                capture_output=True, text=True, creationflags=CREATE_NO_WINDOW, timeout=30,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW, timeout=30,
             )
             info = (proc.stderr or proc.stdout or "(no output)").strip()
         except subprocess.TimeoutExpired:   # e.g. a network drive that stopped answering

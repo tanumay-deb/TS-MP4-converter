@@ -6,7 +6,7 @@
 #define AppName "TS to MP4 Converter"
 ; Overridable from the command line: iscc /DAppVersion=1.4.0 installer.iss
 #ifndef AppVersion
-  #define AppVersion "1.7.4"
+  #define AppVersion "1.7.5"
 #endif
 #define AppPublisher "Tanumay Goswami"
 #define AppExe "TSConverter.exe"

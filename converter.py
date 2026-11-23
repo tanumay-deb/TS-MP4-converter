@@ -488,15 +488,17 @@ class Converter:
             f'"{c}"' if " " in str(c) else str(c) for c in cmd
         ))
 
+        # ffmpeg prints paths as UTF-8; the Windows default (cp1252) choked on names like "●".
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, creationflags=CREATE_NO_WINDOW,
+            text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW,
         )
 
         stop_watcher = threading.Event()
         stalled_event = threading.Event()
         line_q: queue.Queue = queue.Queue()
         stderr_buf: list[str] = []
+        last_line_at = [time.time()]      # when ffmpeg last printed a progress line
 
         def kill_proc():
             if proc.poll() is None:
@@ -531,7 +533,11 @@ class Converter:
                     if current > last_seconds + 0.05:
                         last_seconds = current
                         last_progress_at = now
-                    elif current > 0 and (now - last_progress_at) > stall_timeout:
+                    elif (current > 0 and (now - last_progress_at) > stall_timeout
+                          and now - last_line_at[0] < stall_timeout / 4):
+                        # Stuck only while ffmpeg keeps reporting (every 0.5s) without moving
+                        # on. When reports stop it is writing the end of the file: +faststart
+                        # rewrites all of it, minutes for 3 GB on a busy disk (was killed at 99%).
                         stalled_event.set()
                         kill_proc()
                         return
@@ -543,6 +549,7 @@ class Converter:
         def stdout_reader():
             try:
                 for line in proc.stdout:
+                    last_line_at[0] = time.time()
                     line_q.put(line)
             except Exception:
                 pass
