@@ -3,6 +3,12 @@
 All notable changes to this project. Releases are also published (with installers)
 on the [Releases](https://github.com/tanumay-deb/TS-MP4-converter/releases) page.
 
+## v1.7.7
+- Fixed: "Download & install" now really installs the update and reopens the app.
+  Before, the download finished but the installer never started (and Windows said
+  it "cannot find '\\'"). On version 1.7.6 or older, download the installer from the
+  Releases page once; after that, updates install themselves.
+
 ## v1.7.6
 - Big files show "Finishing…" while the converted file is being written at the end,
   instead of sitting at 100%.

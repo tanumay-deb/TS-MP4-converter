@@ -44,7 +44,7 @@ except ImportError:
     _HAS_SVTTK = False
 
 APP_NAME = "TS to MP4 Converter"
-APP_VERSION = "1.7.6"
+APP_VERSION = "1.7.7"
 SAME_AS_SOURCE = "(same folder as source)"
 
 
@@ -153,6 +153,17 @@ def open_path(path):
             subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
     except OSError:
         open_in_explorer(Path(path))
+
+
+def updater_cmdline(setup_path, app_exe, wait: int = 2) -> str:
+    """cmd line that waits for this app to close, runs setup silently, then relaunches.
+
+    One string, not a list: the list form escaped the inner quotes as \\", which cmd
+    doesn't understand, so setup never ran and start showed "Windows cannot find '\\\\'".
+    "&", not "&&": declining the admin prompt fails setup, and the app must still come back.
+    """
+    return (f'cmd /c "timeout /t {wait} /nobreak >nul & "{setup_path}" /SILENT '
+            f'/SUPPRESSMSGBOXES /CLOSEAPPLICATIONS & start "" "{app_exe}""')
 
 
 SUPPORTED_EXTS = (".ts", ".m2ts", ".mts", ".mkv", ".mp4", ".mov", ".avi",
@@ -868,13 +879,9 @@ class App:
         ttk.Button(btns, text="Later", command=win.destroy).pack(side="right", padx=6)
 
     def _run_installer_and_quit(self, setup_path):
-        # Wait for this app to close, run the installer silently, then relaunch.
-        # "&", not "&&": declining the admin prompt fails setup, and the app must still come back.
-        app_exe = sys.executable
-        cmd = (f'timeout /t 2 /nobreak >nul & "{setup_path}" /SILENT '
-               f'/SUPPRESSMSGBOXES /CLOSEAPPLICATIONS & start "" "{app_exe}"')
         try:
-            subprocess.Popen(["cmd", "/c", cmd], creationflags=0x08000000)  # CREATE_NO_WINDOW
+            subprocess.Popen(updater_cmdline(setup_path, sys.executable),
+                             creationflags=0x08000000)  # CREATE_NO_WINDOW
         except OSError:
             webbrowser.open(setup_path if isinstance(setup_path, str) else str(setup_path))
             return
