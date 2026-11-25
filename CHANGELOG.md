@@ -3,6 +3,14 @@
 All notable changes to this project. Releases are also published (with installers)
 on the [Releases](https://github.com/tanumay-deb/TS-MP4-converter/releases) page.
 
+## v1.7.6
+- Big files show "Finishing…" while the converted file is being written at the end,
+  instead of sitting at 100%.
+- "If exists: Overwrite" no longer replaces a file that is still waiting in the list
+  (for example clip.mp4, added together with clip.mkv). The new file gets a "(1)" name.
+- Mac: closing to the tray no longer hides the window when no tray icon can be shown,
+  and "Show in folder" works for folders.
+
 ## v1.7.5
 - Fixed: long recordings no longer fail with "Stalled at 99%" or "Stalled at 100%".
   The app now waits while the finished file is being written.

@@ -231,23 +231,41 @@ class _ScriptedFfmpeg:
 
 
 def _run_scripted(monkeypatch, script):
+    """Run the engine's ffmpeg loop on a scripted ffmpeg; returns the stages it showed."""
     monkeypatch.setattr(c.subprocess, "Popen", lambda cmd, **kw: _ScriptedFfmpeg(script))
     ctx = c._Ctx(ConversionRequest(src=Path("x.ts"), out_dir=Path("."), duration=10.0))
-    c.Converter()._run(["ffmpeg"], ctx, lambda: None, threading.Event(),
+    stages = []
+    c.Converter()._run(["ffmpeg"], ctx, lambda: stages.append(ctx.stage), threading.Event(),
                        stage="Remuxing", stall_timeout=1.0)
+    return stages
 
 
 def test_silence_while_finishing_is_not_a_stall(monkeypatch):
     # After the last frame +faststart rewrites the whole file and prints nothing; for
     # 3 GB on a busy disk that took over 45s, and the job was killed "Stalled at 100%".
-    _run_scripted(monkeypatch, [(0.05, "out_time_ms=5000000"), (0.05, "out_time_ms=10000000"),
-                                (2.5, "progress=end")])
+    stages = _run_scripted(monkeypatch, [(0.05, "out_time_ms=5000000"),
+                                         (0.05, "out_time_ms=10000000"), (2.5, "progress=end")])
+    assert "Finishing…" in stages            # shown instead of a frozen 100%
 
 
 def test_reports_without_progress_are_a_stall(monkeypatch):
     script = [(0.05, "out_time_ms=5000000")] + [(0.1, "out_time_ms=5000000")] * 30
     with pytest.raises(c.ConversionError, match="Stalled"):
         _run_scripted(monkeypatch, script)
+
+
+def test_overwrite_never_replaces_a_file_still_in_the_queue(tmp_path, monkeypatch):
+    # clip.mkv and clip.mp4 dropped together: Overwrite on clip.mkv used to replace
+    # clip.mp4 before its own turn came.
+    monkeypatch.setattr(c, "get_logs_dir", lambda: tmp_path)
+    mkv, mp4 = tmp_path / "clip.mkv", tmp_path / "clip.mp4"
+    _make_clip(mkv)
+    _make_clip(mp4)
+    before = mp4.read_bytes()
+    r = _convert(mkv, tmp_path, conflict=ConflictPolicy.OVERWRITE,
+                 queued_sources=frozenset({mkv, mp4}))
+    assert r.status == JobStatus.DONE and r.out_path.name == "clip (1).mp4"
+    assert mp4.read_bytes() == before
 
 
 def test_failed_overwrite_keeps_the_existing_file(tmp_path, monkeypatch):

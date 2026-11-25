@@ -10,6 +10,7 @@ from __future__ import annotations
 import concurrent.futures
 import threading
 import time
+from dataclasses import replace
 from typing import Callable, List
 
 from .models import Job, JobStatus
@@ -79,6 +80,7 @@ class QueueController:
         lock = threading.Lock()
         running, overlapped = set(), set()   # ids of jobs converting now / alongside another
         retry_alone: List[Job] = []
+        sources = frozenset(j.src for j in pending)
 
         def update_overall():
             with lock:
@@ -118,7 +120,8 @@ class QueueController:
             # The engine is pure: it returns a result, the controller maps it
             # onto the Job here. pause_event also suspends a running ffmpeg.
             result = self._converter.convert(
-                job.to_request(), on_progress, self.cancel_event, self.pause_event)
+                replace(job.to_request(), queued_sources=sources),
+                on_progress, self.cancel_event, self.pause_event)
             with lock:
                 running.discard(id(job))
             if result.disk_full and not alone and id(job) in overlapped:

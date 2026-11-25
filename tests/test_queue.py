@@ -11,8 +11,10 @@ class FakeConverter:
     def __init__(self, status_by_name):
         self.status_by_name = status_by_name
         self.ended = None
+        self.queued = None
 
     def convert(self, request, on_progress, cancel_event, pause_event=None):
+        self.queued = request.queued_sources
         on_progress(ProgressEvent(stage="Running", progress_pct=50.0))
         status = self.status_by_name.get(request.src.name, JobStatus.DONE)
         return ConversionResult(status=status, out_path=Path(request.src.stem + ".mp4"),
@@ -49,6 +51,8 @@ def test_queue_runs_all_jobs_and_reports_counts():
     assert sorted(recorded) == ["a.ts", "b.ts", "c.ts"]   # done + failed both recorded
     # Outputs are freed once, after the whole batch, not per job.
     assert sorted(p.name for p in conv.ended) == ["a.mp4", "b.mp4", "c.mp4"]
+    # Every job knows the batch's sources, so Overwrite can't replace one still queued.
+    assert conv.queued == {Path("a.ts"), Path("b.ts"), Path("c.ts")}
 
 
 def test_delete_source_only_after_a_real_done(tmp_path):

@@ -40,12 +40,16 @@ class Tray:
         except Exception:  # noqa: BLE001 - no usable tray backend (e.g. headless)
             self._icon = None
 
-    def start(self) -> None:
+    def start(self) -> bool:
+        """Show the icon. False when no tray works here (e.g. macOS, where pystray wants
+        the main thread Tk already has), so the caller must not hide the window."""
         if self._icon is not None:
             try:
                 self._icon.run_detached()
+                return True
             except Exception:  # noqa: BLE001
                 pass
+        return False
 
     def stop(self) -> None:
         if self._icon is not None:

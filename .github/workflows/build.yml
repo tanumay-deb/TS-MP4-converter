@@ -82,7 +82,12 @@ jobs:
         shell: pwsh
         run: |
           if (-not $env:WINGET_TOKEN) { Write-Host "WINGET_TOKEN not set; skipping winget."; exit 0 }
-          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          # Pinned and hash-checked: this exe gets the token. To upgrade, take the new
+          # release's wingetcreate.exe URL and SHA256 from github.com/microsoft/winget-create.
+          Invoke-WebRequest https://github.com/microsoft/winget-create/releases/download/v1.28.1.0/wingetcreate.exe -OutFile wingetcreate.exe
+          if ((Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash -ne "63D980BA79E97042395BD6EB5992C2DB9E01E9E7A8A22958A95C288F27310413") {
+            throw "wingetcreate.exe does not match the pinned SHA256"
+          }
           $tag = "${{ steps.ver.outputs.tag }}"
           $base = "https://github.com/${{ github.repository }}/releases"
           .\wingetcreate.exe update TSConverter.TSConverter --version ${{ steps.ver.outputs.version }} `

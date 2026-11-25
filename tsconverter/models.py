@@ -63,6 +63,7 @@ class ConversionRequest:
     conflict: ConflictPolicy = ConflictPolicy.RENAME
     duration: float = 0.0          # known source duration; 0.0 => engine probes
     out_format: str = "mp4"        # forward-compat for multi-format (M2)
+    queued_sources: frozenset = frozenset()   # the batch's sources: Overwrite never replaces one
 
 
 @dataclass

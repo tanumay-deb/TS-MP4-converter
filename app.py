@@ -44,7 +44,7 @@ except ImportError:
     _HAS_SVTTK = False
 
 APP_NAME = "TS to MP4 Converter"
-APP_VERSION = "1.7.5"
+APP_VERSION = "1.7.6"
 SAME_AS_SOURCE = "(same folder as source)"
 
 
@@ -138,8 +138,8 @@ def open_in_explorer(path: Path):
             subprocess.Popen(["explorer", "/select,", str(path)])
         else:
             os.startfile(str(path))
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", "-R" if path.is_file() else "", str(path)])
+    elif sys.platform == "darwin":       # -R selects a file in Finder; a folder just opens
+        subprocess.Popen(["open", "-R", str(path)] if path.is_file() else ["open", str(path)])
     else:
         subprocess.Popen(["xdg-open", str(path.parent if path.is_file() else path)])
 
@@ -1523,9 +1523,12 @@ class App:
                 on_show=lambda: self.root.after(0, self._show_from_tray),
                 on_quit=lambda: self.root.after(0, self._quit_from_tray),
             )
-        self.tray.start()
+        if not self.tray.start():      # no working tray: hiding would leave no way back
+            self.tray = None
+            return False
         self._hidden = True
         self.root.withdraw()
+        return True
 
     def _show_from_tray(self):
         self._hidden = False
@@ -1551,8 +1554,7 @@ class App:
     def _on_close(self):
         # X button hides to tray when enabled (keeps converting in the background).
         if (not self._tray_quit and self.settings.get("minimize_to_tray")
-                and tray.available()):
-            self._hide_to_tray()
+                and tray.available() and self._hide_to_tray()):
             return
         if self.is_running:
             if not messagebox.askokcancel("Quit",

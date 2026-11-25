@@ -181,7 +181,7 @@ def _key(path: Path) -> str:
 
 
 def resolve_output_path(src: Path, out_dir: Path, policy: ConflictPolicy,
-                        ext: str = ".mp4") -> Optional[Path]:
+                        ext: str = ".mp4", queued=frozenset()) -> Optional[Path]:
     """Pick and reserve the output path; free it with release_output_path().
 
     Parallel jobs check before either writes, so two sources with the same name
@@ -189,9 +189,12 @@ def resolve_output_path(src: Path, out_dir: Path, policy: ConflictPolicy,
     another running job reserved, or the source itself, is taken under every policy.
     """
     candidate = out_dir / (src.stem + ext)
+    # clip.mkv + clip.mp4 dropped together: Overwrite must not replace clip.mp4 before its turn.
+    overwrite = (policy == ConflictPolicy.OVERWRITE
+                 and _key(candidate) not in {_key(p) for p in queued})
     with _claim_lock:
         if _key(candidate) not in _claimed and _key(candidate) != _key(src):
-            if not candidate.exists() or policy == ConflictPolicy.OVERWRITE:
+            if not candidate.exists() or overwrite:
                 _claimed.add(_key(candidate))
                 return candidate
             if policy == ConflictPolicy.SKIP:
@@ -323,7 +326,8 @@ class Converter:
             ctx.log_lines.append(f"Format:   {handler.id} ({handler.kind})")
 
             ctx.out_dir.mkdir(parents=True, exist_ok=True)
-            final_path = resolve_output_path(ctx.src, ctx.out_dir, ctx.conflict, handler.ext)
+            final_path = resolve_output_path(ctx.src, ctx.out_dir, ctx.conflict, handler.ext,
+                                             request.queued_sources)
             if final_path is None:
                 raise _OutputExists()
             ctx.log_lines.append(f"Output:   {final_path}")
@@ -530,17 +534,20 @@ class Converter:
                 else:
                     current = ctx.seconds_done
                     now = time.time()
+                    # ffmpeg reports every 0.5s; quiet = it stopped. At the end that means it
+                    # is writing the file out: +faststart rewrites all of it, minutes for 3 GB
+                    # on a busy disk (was killed as "Stalled at 99%").
+                    quiet = now - last_line_at[0] >= stall_timeout / 4
                     if current > last_seconds + 0.05:
                         last_seconds = current
                         last_progress_at = now
-                    elif (current > 0 and (now - last_progress_at) > stall_timeout
-                          and now - last_line_at[0] < stall_timeout / 4):
-                        # Stuck only while ffmpeg keeps reporting (every 0.5s) without moving
-                        # on. When reports stop it is writing the end of the file: +faststart
-                        # rewrites all of it, minutes for 3 GB on a busy disk (was killed at 99%).
-                        stalled_event.set()
+                    elif current > 0 and (now - last_progress_at) > stall_timeout and not quiet:
+                        stalled_event.set()          # still reporting, not moving: stuck
                         kill_proc()
                         return
+                    if quiet and ctx.progress_pct >= 95 and ctx.stage != "Finishing…":
+                        ctx.stage = "Finishing…"     # not stuck at 100%: writing the file
+                        on_update()
                 if stop_watcher.wait(0.2):
                     if suspended:
                         procctl.resume(proc)
